@@ -1,0 +1,7 @@
+# Each slug must have source in targets/plugins/<slug> or a local ZIP in targets/archives/<slug>.zip.
+file-manager
+akismet
+hello-dolly
+classic-editor
+contact-form-7
+my-test-plugin

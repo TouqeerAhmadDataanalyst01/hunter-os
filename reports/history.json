@@ -1,0 +1,20 @@
+[
+  {
+    "plugin_slug": "file-manager",
+    "file": "test.php",
+    "line": 2,
+    "recorded_at": "2026-10-27T03:52:24.803987+00:00"
+  },
+  {
+    "plugin_slug": "my-test-plugin",
+    "file": "my-test-plugin.php",
+    "line": 6,
+    "recorded_at": "2026-10-27T04:12:52.219335+00:00"
+  },
+  {
+    "plugin_slug": "my-test-plugin",
+    "file": "my-test-plugin.php",
+    "line": 12,
+    "recorded_at": "2026-10-27T04:12:52.219986+00:00"
+  }
+]

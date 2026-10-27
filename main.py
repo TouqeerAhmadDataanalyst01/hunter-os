@@ -5,11 +5,13 @@ from __future__ import annotations
 import argparse
 import re
 import zipfile
+from dataclasses import dataclass
 from pathlib import Path
 
 from analyzer.platform import SUPPORTED_PLATFORMS, detect_platform
-from analyzer.wordpress import scan_plugin
+from analyzer.wordpress import list_scan_files, scan_plugin
 from duplicate_checker import is_duplicate, record_finding
+from reporter.json_report import write_json_report
 from reporter.patchstack import make_report
 from tools.download import get_plugin_local_or_instructions
 
@@ -19,6 +21,12 @@ TARGETS_FILE = ROOT / "targets" / "wordpress.txt"
 LOCAL_PLUGINS = ROOT / "targets" / "plugins"
 REPORTS_DIR = ROOT / "reports"
 SLUG_PATTERN = re.compile(r"[a-z0-9][a-z0-9_-]*")
+
+
+@dataclass
+class ScanResult:
+    findings: list[dict[str, object]]
+    exit_code: int
 
 
 def load_targets(path: Path = TARGETS_FILE) -> list[str]:
@@ -34,20 +42,26 @@ def load_targets(path: Path = TARGETS_FILE) -> list[str]:
     return slugs
 
 
-def scan_target(slug: str, platform_override: str = "auto") -> list[dict[str, object]]:
+def scan_target(
+    slug: str,
+    platform_override: str = "auto",
+    dry_run: bool = False,
+    reports_dir: Path | None = None,
+) -> ScanResult:
     """Scan a local plugin directory or a ZIP already stored in the workspace."""
+    report_root = reports_dir if reports_dir is not None else REPORTS_DIR
     if not SLUG_PATTERN.fullmatch(slug):
         print(f"[skip] Invalid plugin slug: {slug!r}")
-        return []
+        return ScanResult([], 2)
 
     try:
         plugin_path = get_plugin_local_or_instructions(slug)
     except (OSError, ValueError, zipfile.BadZipFile) as error:
         print(f"[error] Could not prepare local source for {slug}: {error}")
-        return []
+        return ScanResult([], 2)
     if plugin_path is None:
         print(f"[skip] No local source was found for {slug}.")
-        return []
+        return ScanResult([], 2)
 
     try:
         platform = (
@@ -57,10 +71,10 @@ def scan_target(slug: str, platform_override: str = "auto") -> list[dict[str, ob
         )
     except NotADirectoryError as error:
         print(f"[error] Could not identify platform: {error}")
-        return []
+        return ScanResult([], 4)
     if platform is None:
         print("[skip] Could not detect a supported project platform.")
-        return []
+        return ScanResult([], 3)
 
     print(f"[platform] {platform}")
     if platform != "wordpress":
@@ -68,41 +82,53 @@ def scan_target(slug: str, platform_override: str = "auto") -> list[dict[str, ob
             f"[manual] Platform detected, but no {platform} security rules are "
             "implemented. No vulnerability scan was performed."
         )
-        return []
+        return ScanResult([], 3)
+
+    if dry_run:
+        try:
+            candidates = list_scan_files(plugin_path)
+        except NotADirectoryError as error:
+            print(f"[error] Could not list source files: {error}")
+            return ScanResult([], 4)
+        print(f"[dry-run] Eligible PHP files: {len(candidates)}")
+        for candidate in candidates:
+            print(f"  {candidate.relative_to(plugin_path).as_posix()}")
+        return ScanResult([], 0)
 
     print(f"[scan] Checking local source: {plugin_path}")
     findings = scan_plugin(plugin_path)
-    safe_count = sum(
-        finding.get("status") == "LIKELY SAFE - has auth check" for finding in findings
-    )
+    auth_count = sum(bool(finding.get("auth_present")) for finding in findings)
     print(
-        f"[scan] Potential findings: {len(findings) - safe_count}; "
-        f"LIKELY SAFE matches: {safe_count}."
+        f"[scan] Potential findings: {len(findings)}; "
+        f"nearby auth signals to review: {auth_count}."
     )
+    json_path = write_json_report(slug, platform, findings, report_root)
+    print(f"[report] Saved current-run JSON to {json_path}")
 
     for finding in findings:
         file_name = str(finding["file"])
         line_no = int(finding["line"])
-        if finding.get("status") == "LIKELY SAFE - has auth check":
-            print(
-                f"[LIKELY SAFE] {file_name}:{line_no} has nearby auth check "
-                f"{finding['auth_check']!r}; not reported as a bug."
-            )
-            continue
+        if finding.get("auth_present"):
+            print(f"[review] {file_name}:{line_no} has nearby auth token {finding['auth_check']!r}.")
         if is_duplicate(slug, file_name, line_no):
             print(f"[duplicate] {file_name}:{line_no} was seen in the last 14 days.")
             continue
 
-        report_path = make_report(slug, finding, reports_dir=REPORTS_DIR)
-        record_finding(slug, file_name, line_no, reports_dir=REPORTS_DIR)
+        report_path = make_report(slug, finding, reports_dir=report_root)
+        record_finding(slug, file_name, line_no, reports_dir=report_root)
         print(f"[report] Saved local review notes to {report_path}")
 
-    return findings
+    return ScanResult(findings, 1 if findings else 0)
 
 
-def main(argv: list[str] | None = None) -> None:
+def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="Scan local WordPress plugin source.")
     parser.add_argument("--target", help="scan only this slug from targets/wordpress.txt")
+    parser.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="list eligible files without running heuristics or writing reports",
+    )
     parser.add_argument(
         "--platform",
         choices=("auto", *SUPPORTED_PLATFORMS),
@@ -117,24 +143,31 @@ def main(argv: list[str] | None = None) -> None:
         slugs = load_targets()
     except (OSError, UnicodeError) as error:
         print(f"[error] Could not read targets: {error}")
-        return
+        return 2
 
     if not slugs:
         print("[info] No plugin slugs are listed in targets/wordpress.txt.")
-        return
+        return 2
 
     if args.target:
         if args.target not in slugs:
             print(f"[error] Target is not listed in {TARGETS_FILE}: {args.target}")
-            return
+            return 2
         slugs = [args.target]
 
+    exit_code = 0
     for slug in slugs:
         print(f"\n[target] {slug}")
-        scan_target(slug, platform_override=args.platform)
+        result = scan_target(
+            slug,
+            platform_override=args.platform,
+            dry_run=args.dry_run,
+        )
+        exit_code = max(exit_code, result.exit_code)
 
     print("\nDone. Heuristic matches require manual verification and authorization.")
+    return exit_code
 
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())

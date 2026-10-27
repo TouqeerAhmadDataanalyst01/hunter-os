@@ -90,8 +90,11 @@ def _inspect_file(path: Path, root: Path) -> list[dict[str, object]]:
                 "file": relative_file,
                 "line": line,
                 "type": finding_type,
-                "status": "LIKELY SAFE - has auth check" if auth_check else "REVIEW",
+                "status": "POTENTIAL",
+                "confidence": "LOW",
+                "auth_present": auth_check is not None,
                 "auth_check": auth_check,
+                "manual_verification_required": True,
                 "description": description,
                 "evidence": _context(text, line),
                 "poc": "Not generated. Review and validate only in an authorized local test environment.",
@@ -112,7 +115,18 @@ def scan_plugin(path: str | Path) -> list[dict[str, object]]:
         raise NotADirectoryError(f"Plugin source directory not found: {root}")
 
     findings: list[dict[str, object]] = []
-    for source_file in sorted(root.rglob("*")):
-        if source_file.is_file() and _is_in_scan_scope(source_file, root):
-            findings.extend(_inspect_file(source_file, root))
+    for source_file in list_scan_files(root):
+        findings.extend(_inspect_file(source_file, root))
     return findings
+
+
+def list_scan_files(path: str | Path) -> list[Path]:
+    """List PHP files that match the scanner's scope without reading contents."""
+    root = Path(path).expanduser().resolve()
+    if not root.is_dir():
+        raise NotADirectoryError(f"Plugin source directory not found: {root}")
+    return [
+        source_file
+        for source_file in sorted(root.rglob("*"))
+        if source_file.is_file() and _is_in_scan_scope(source_file, root)
+    ]

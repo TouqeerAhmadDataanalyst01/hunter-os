@@ -38,7 +38,7 @@ class ScannerTests(unittest.TestCase):
             )
             self.assertTrue(all("Not generated" in finding["poc"] for finding in findings))
 
-    def test_upload_with_file_level_nonce_check_is_not_flagged(self) -> None:
+    def test_upload_with_nonce_check_remains_potential_and_annotated(self) -> None:
         with tempfile.TemporaryDirectory() as temporary_directory:
             root = Path(temporary_directory)
             (root / "guarded.php").write_text(
@@ -49,7 +49,8 @@ class ScannerTests(unittest.TestCase):
             findings = scan_plugin(root)
 
             self.assertEqual(len(findings), 1)
-            self.assertEqual(findings[0]["status"], "LIKELY SAFE - has auth check")
+            self.assertEqual(findings[0]["status"], "POTENTIAL")
+            self.assertTrue(findings[0]["auth_present"])
             self.assertEqual(findings[0]["auth_check"], "check_admin_referer")
 
     def test_scans_only_root_and_primary_directories_outside_vendor(self) -> None:
@@ -96,7 +97,8 @@ class ScannerTests(unittest.TestCase):
             findings = scan_plugin(root)
 
             self.assertEqual(len(findings), 1)
-            self.assertEqual(findings[0]["status"], "REVIEW")
+            self.assertEqual(findings[0]["status"], "POTENTIAL")
+            self.assertFalse(findings[0]["auth_present"])
 
     def test_duplicate_window_uses_local_history(self) -> None:
         with tempfile.TemporaryDirectory() as temporary_directory:

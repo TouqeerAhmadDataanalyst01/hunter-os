@@ -35,8 +35,9 @@ The current implementation can:
 - Identify WordPress, Laravel, Django, or Node.js from conventional marker files.
 - Run three existing text-pattern checks on in-scope PHP files for a WordPress project.
 - Ignore common generated and dependency directories.
-- Look for selected authorization-related tokens near a match and suppress a finding from the report when one is found.
-- Write a Markdown review report and keep local duplicate history.
+- Look for selected authorization-related tokens near a match and record them as context without suppressing the finding.
+- Write Markdown and JSON reports and keep local duplicate history.
+- Preview eligible source paths with `--dry-run` and return meaningful exit codes.
 - Run its tests locally and in GitHub Actions.
 
 It does not download targets, query vulnerability databases, generate exploit requests, calculate payouts, or assign a verified severity score.
@@ -97,9 +98,9 @@ When you run `python main.py --target my-plugin`, the program:
 4. Extracts a local ZIP if needed, with path traversal and symlink checks.
 5. Detects the project platform unless you chose `--platform` explicitly.
 6. Runs the WordPress PHP heuristics only if the selected platform is `wordpress`.
-7. Prints potential-finding and likely-safe counts.
-8. Skips report creation for findings with a nearby auth token, and skips recently recorded duplicates.
-9. Appends remaining findings to the local Markdown report and records their file, line, and timestamp in local history.
+7. Prints the potential-finding count and how many matches have a nearby auth token.
+8. Writes JSON for all matches from the current run. A nearby auth token is context, not proof the operation is protected.
+9. Skips duplicate Markdown/history entries recorded in the previous 14 days; new findings are appended to Markdown and recorded in local history.
 
 The scanner does not start WordPress or execute plugin code. It reads source as text.
 
@@ -151,7 +152,7 @@ Within the 50 lines before the matched token, the analyzer looks for any of thes
 - `is_user_logged_in`
 - `permission_callback`
 
-If any appears, the match is marked `LIKELY SAFE - has auth check` and the CLI does not write it as a potential bug. This is only a suppression heuristic: it does not prove the check protects this code path, and a check located elsewhere in those lines can cause a false suppression. A match with no such token remains a potential finding for manual review.
+If any appears, the match remains `POTENTIAL`, but `auth_present` is set to `true` and the token is recorded. This is only a context clue: it does not prove the check protects this code path. Matches with or without a token require manual review.
 
 ## 8. Understanding Findings
 
@@ -163,7 +164,10 @@ The Markdown report contains:
 - Relative source filename and line number.
 - A short explanation of the heuristic.
 - A small excerpt of source as evidence.
+- Confidence, nearby-auth context, and an explicit manual-verification flag.
 - Sections for PoC, Impact, and CVSS that explicitly avoid inventing those details.
+
+The JSON report `report_json.json` is overwritten each run and describes that run's findings. It includes file, line, type, confidence, auth presence, platform, evidence, status, and `manual_verification_required`.
 
 No exploit code or request is generated. The report's PoC section is an authorization and manual-review note.
 
@@ -195,6 +199,14 @@ Choose a platform explicitly:
 python main.py --target my-plugin --platform wordpress
 ```
 
+List eligible files without running the heuristics or writing reports:
+
+```bash
+python main.py --target my-plugin --dry-run
+```
+
+The CLI returns `0` for a clean scan/dry-run, `1` when matches exist, `2` for missing or invalid target/source/archive configuration, `3` for ambiguous or unsupported platform handling, and `4` for internal source-directory or eligible-file listing errors.
+
 Inspect reports and history:
 
 ```bash
@@ -211,7 +223,7 @@ python -m unittest discover -s tests -v
 
 ## 11. Tests and GitHub Actions
 
-`tests/test_scanner.py` covers the current WordPress heuristic and local archive/history/report behavior. `tests/test_v4_multi.py` covers platform markers, ambiguous marker handling, the platform CLI override, the authorization window, and synthetic inclusion/exclusion cases.
+`tests/test_scanner.py` covers the current WordPress heuristic and local archive/history/report behavior. `tests/test_v4_multi.py` covers platform markers, ambiguous marker handling, the platform CLI override, the authorization window, JSON output, dry-run, exit codes, temporary report storage, and synthetic inclusion/exclusion cases.
 
 The workflow at `.github/workflows/tests.yml` runs compileall and the unit suite on Python 3.10, 3.11, and 3.12 for pushes and pull requests. It does not download plugins or run target scans. GitHub Actions must fetch its checkout/setup actions and Python runtime, but the Hunter OS scanner itself makes no remote requests.
 
@@ -231,7 +243,7 @@ Check for the expected marker file. If it is a WordPress plugin without `wp-conf
 
 ### No report appears
 
-Check the CLI output for a likely-safe match or duplicate. Also confirm the PHP file is within the permitted directories, is not under an ignored directory, and is no larger than 2 MB.
+Check the CLI output for a duplicate. Also confirm the PHP file is within the permitted directories, is not under an ignored directory, and is no larger than 2 MB. A nearby auth token is shown as context but does not suppress report generation.
 
 ### ZIP extraction errors
 

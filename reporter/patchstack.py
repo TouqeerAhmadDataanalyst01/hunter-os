@@ -38,6 +38,12 @@ This is a static-analysis heuristic, not a confirmed vulnerability. Review the s
 
 **Source:** `{finding['file']}` at line {finding['line']}
 
+**Confidence:** {finding.get('confidence', 'LOW')}
+
+**Nearby auth token:** {finding.get('auth_check') or 'None detected in the preceding 50 lines'}
+
+**Manual verification required:** Yes
+
 ## PoC
 
 No exploit request is generated. Validate behavior only in a local, isolated environment for which you have authorization.

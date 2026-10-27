@@ -35,9 +35,15 @@ def detect_platform(path: str | Path) -> str | None:
     if not root.is_dir():
         raise NotADirectoryError(f"Project directory not found: {root}")
 
-    for platform, marker in PLATFORM_MARKERS:
-        if _contains_marker(root, marker):
-            return platform
+    detected = [
+        platform
+        for platform, marker in PLATFORM_MARKERS
+        if _contains_marker(root, marker)
+    ]
+    if len(detected) == 1:
+        return detected[0]
+    if len(detected) > 1:
+        return None
 
     for php_file in root.rglob("*.php"):
         relative = php_file.relative_to(root)

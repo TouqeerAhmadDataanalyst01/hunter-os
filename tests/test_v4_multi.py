@@ -1,11 +1,15 @@
 from __future__ import annotations
 
+import io
 import tempfile
 import unittest
+from contextlib import redirect_stdout
 from pathlib import Path
+from unittest.mock import patch
 
 from analyzer.platform import detect_platform
 from analyzer.wordpress import scan_plugin
+from main import main
 
 
 class PlatformDetectionTests(unittest.TestCase):
@@ -36,6 +40,13 @@ class PlatformDetectionTests(unittest.TestCase):
             marker.touch()
             self.assertIsNone(detect_platform(root))
 
+    def test_conflicting_markers_are_ambiguous(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            (root / "artisan").touch()
+            (root / "manage.py").touch()
+            self.assertIsNone(detect_platform(root))
+
 
 class ExistingWordPressFilterTests(unittest.TestCase):
     def test_synthetic_vuln_test_keeps_one_potential_finding(self) -> None:
@@ -62,6 +73,37 @@ class ExistingWordPressFilterTests(unittest.TestCase):
                 encoding="utf-8",
             )
             self.assertEqual(scan_plugin(root), [])
+
+    def test_auth_check_exactly_50_lines_before_is_likely_safe(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            lines = ["<?php current_user_can('upload');"]
+            lines.extend("// filler" for _ in range(49))
+            lines.append("$file = $_FILES['upload'];")
+            (root / "plugin.php").write_text("\n".join(lines), encoding="utf-8")
+
+            findings = scan_plugin(root)
+
+            self.assertEqual(len(findings), 1)
+            self.assertEqual(findings[0]["status"], "LIKELY SAFE - has auth check")
+
+    def test_cli_platform_override_routes_without_unimplemented_scan(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            output = io.StringIO()
+            with (
+                patch("main.load_targets", return_value=["fixture"]),
+                patch(
+                    "main.get_plugin_local_or_instructions",
+                    return_value=Path(temporary_directory),
+                ),
+                patch("main.scan_plugin") as scan_mock,
+                redirect_stdout(output),
+            ):
+                main(["--target", "fixture", "--platform", "laravel"])
+
+            scan_mock.assert_not_called()
+            self.assertIn("[platform] laravel", output.getvalue())
+            self.assertIn("No vulnerability scan was performed", output.getvalue())
 
 
 if __name__ == "__main__":

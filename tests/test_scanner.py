@@ -42,11 +42,61 @@ class ScannerTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temporary_directory:
             root = Path(temporary_directory)
             (root / "guarded.php").write_text(
-                "<?php check_admin_referer('upload'); $file = $_FILES['upload'];",
+                "<?php check_admin_referer('upload');\n$file = $_FILES['upload'];",
                 encoding="utf-8",
             )
 
-            self.assertEqual(scan_plugin(root), [])
+            findings = scan_plugin(root)
+
+            self.assertEqual(len(findings), 1)
+            self.assertEqual(findings[0]["status"], "LIKELY SAFE - has auth check")
+            self.assertEqual(findings[0]["auth_check"], "check_admin_referer")
+
+    def test_scans_only_root_and_primary_directories_outside_vendor(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            source_files = {
+                "plugin.php": "<?php $file = $_FILES['root'];",
+                "includes/handler.php": "<?php $file = $_FILES['includes'];",
+                "admin/handler.php": "<?php $file = $_FILES['admin'];",
+                "public/handler.php": "<?php $file = $_FILES['public'];",
+                "vendor/package/handler.php": "<?php $file = $_FILES['vendor'];",
+                "node_modules/package/handler.php": "<?php $file = $_FILES['node'];",
+                "tests/helper.php": "<?php $file = $_FILES['tests'];",
+                "test/helper.php": "<?php $file = $_FILES['test'];",
+                "my-vendor-helper.php": "<?php $file = $_FILES['vendor_name'];",
+                "assets/handler.php": "<?php $file = $_FILES['assets'];",
+            }
+            for relative_name, content in source_files.items():
+                source_path = root / relative_name
+                source_path.parent.mkdir(parents=True, exist_ok=True)
+                source_path.write_text(content, encoding="utf-8")
+
+            findings = scan_plugin(root)
+
+            self.assertEqual(
+                {finding["file"] for finding in findings},
+                {
+                    "plugin.php",
+                    "includes/handler.php",
+                    "admin/handler.php",
+                    "public/handler.php",
+                    "my-vendor-helper.php",
+                },
+            )
+
+    def test_auth_check_beyond_50_lines_does_not_mark_finding_safe(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            lines = ["<?php current_user_can('upload');"]
+            lines.extend("// filler" for _ in range(50))
+            lines.append("$file = $_FILES['upload'];")
+            (root / "plugin.php").write_text("\n".join(lines), encoding="utf-8")
+
+            findings = scan_plugin(root)
+
+            self.assertEqual(len(findings), 1)
+            self.assertEqual(findings[0]["status"], "REVIEW")
 
     def test_duplicate_window_uses_local_history(self) -> None:
         with tempfile.TemporaryDirectory() as temporary_directory:

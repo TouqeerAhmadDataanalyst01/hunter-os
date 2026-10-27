@@ -6,7 +6,13 @@ import re
 from pathlib import Path
 
 
-PHP_SUFFIXES = {".php", ".phtml", ".php3", ".inc"}
+IGNORE_DIRS = {"vendor", "node_modules", "tests", "test"}
+PRIMARY_DIRECTORIES = {"includes", "admin", "public"}
+AUTH_CHECK_PATTERN = re.compile(
+    r"current_user_can|check_ajax_referer|check_admin_referer|"
+    r"wp_verify_nonce|is_user_logged_in|permission_callback",
+    re.IGNORECASE,
+)
 MAX_SOURCE_BYTES = 2_000_000
 
 
@@ -21,6 +27,22 @@ def _context(text: str, line: int, radius: int = 2) -> str:
     return "\n".join(
         f"{index + 1}: {lines[index]}" for index in range(start, end)
     )
+
+
+def _is_in_scan_scope(path: Path, root: Path) -> bool:
+    relative_path = path.relative_to(root)
+    if any(part.lower() in IGNORE_DIRS for part in relative_path.parts[:-1]):
+        return False
+    if path.suffix.lower() != ".php":
+        return False
+    return len(relative_path.parts) == 1 or relative_path.parts[0].lower() in PRIMARY_DIRECTORIES
+
+
+def _auth_check_before(text: str, offset: int) -> str | None:
+    line_start = text.rfind("\n", 0, offset) + 1
+    previous_lines = text[:line_start].splitlines()[-50:]
+    match = AUTH_CHECK_PATTERN.search("\n".join(previous_lines))
+    return match.group(0) if match else None
 
 
 def _inspect_file(path: Path, root: Path) -> list[dict[str, object]]:
@@ -38,7 +60,6 @@ def _inspect_file(path: Path, root: Path) -> list[dict[str, object]]:
         (
             "Unauthenticated File Upload",
             re.compile(r"\$_FILES\b", re.IGNORECASE),
-            re.compile(r"current_user_can|check_admin_referer|wp_verify_nonce", re.I),
             "File upload input is present, but no capability or nonce check was found in this file.",
         ),
         (
@@ -47,7 +68,6 @@ def _inspect_file(path: Path, root: Path) -> list[dict[str, object]]:
                 r"\$wpdb\s*->\s*query\s*\([^;]{0,500}?\$_POST\b",
                 re.IGNORECASE,
             ),
-            re.compile(r"\$_POST\b", re.IGNORECASE),
             "A database query call and POST input occur in this file; verify that values are validated and parameterized.",
         ),
         (
@@ -55,32 +75,23 @@ def _inspect_file(path: Path, root: Path) -> list[dict[str, object]]:
             re.compile(
                 r"\$_COOKIE\b[\s\S]{0,300}?(?:==\s*true|true\s*==)", re.IGNORECASE
             ),
-            re.compile(r"(?:==\s*true|true\s*==)", re.IGNORECASE),
             "Cookie input and a comparison with true occur in this file; review the authorization logic.",
         ),
     )
 
-    for finding_type, primary_pattern, secondary_pattern, description in checks:
-        if finding_type == "Unauthenticated File Upload":
-            if not primary_pattern.search(text) or secondary_pattern.search(text):
-                continue
-            match = primary_pattern.search(text)
-        elif finding_type == "Unauthenticated SQL Injection":
-            match = primary_pattern.search(text)
-            if not match:
-                continue
-        else:
-            match = primary_pattern.search(text)
-            if not match:
-                continue
-
-        assert match is not None
+    for finding_type, primary_pattern, description in checks:
+        match = primary_pattern.search(text)
+        if not match:
+            continue
         line = _line_for(text, match.start())
+        auth_check = _auth_check_before(text, match.start())
         findings.append(
             {
                 "file": relative_file,
                 "line": line,
                 "type": finding_type,
+            "status": "LIKELY SAFE - has auth check" if auth_check else "REVIEW",
+            "auth_check": auth_check,
                 "description": description,
                 "evidence": _context(text, line),
                 "poc": "Not generated. Review and validate only in an authorized local test environment.",
@@ -102,6 +113,6 @@ def scan_plugin(path: str | Path) -> list[dict[str, object]]:
 
     findings: list[dict[str, object]] = []
     for source_file in sorted(root.rglob("*")):
-        if source_file.is_file() and source_file.suffix.lower() in PHP_SUFFIXES:
+        if source_file.is_file() and _is_in_scan_scope(source_file, root):
             findings.extend(_inspect_file(source_file, root))
     return findings

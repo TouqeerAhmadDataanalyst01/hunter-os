@@ -16,5 +16,35 @@
     "file": "my-test-plugin.php",
     "line": 12,
     "recorded_at": "2026-10-27T04:12:52.219986+00:00"
+  },
+  {
+    "plugin_slug": "file-manager",
+    "file": "file-manager/vendor/bitapps/wp-kit/src/Http/Request/Request.php",
+    "line": 132,
+    "recorded_at": "2026-10-27T04:34:12.270387+00:00"
+  },
+  {
+    "plugin_slug": "file-manager",
+    "file": "file-manager/vendor/studio-42/elfinder/php/editors/ZohoOffice/editor.php",
+    "line": 234,
+    "recorded_at": "2026-10-27T04:34:12.270937+00:00"
+  },
+  {
+    "plugin_slug": "file-manager",
+    "file": "file-manager/vendor/studio-42/elfinder/php/elFinderConnector.class.php",
+    "line": 388,
+    "recorded_at": "2026-10-27T04:34:12.271625+00:00"
+  },
+  {
+    "plugin_slug": "file-manager",
+    "file": "file-manager/vendor/studio-42/elfinder/php/elFinderVolumeDriver.class.php",
+    "line": 4376,
+    "recorded_at": "2026-10-27T04:34:12.272180+00:00"
+  },
+  {
+    "plugin_slug": "vuln-test",
+    "file": "test.php",
+    "line": 3,
+    "recorded_at": "2026-10-27T04:50:50.556202+00:00"
   }
 ]

@@ -5,3 +5,4 @@ hello-dolly
 classic-editor
 contact-form-7
 my-test-plugin
+vuln-test

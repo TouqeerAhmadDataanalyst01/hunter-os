@@ -50,11 +50,23 @@ def scan_target(slug: str) -> list[dict[str, object]]:
 
     print(f"[scan] Checking local source: {plugin_path}")
     findings = scan_plugin(plugin_path)
-    print(f"[scan] Heuristic checks returned {len(findings)} finding(s).")
+    safe_count = sum(
+        finding.get("status") == "LIKELY SAFE - has auth check" for finding in findings
+    )
+    print(
+        f"[scan] Potential findings: {len(findings) - safe_count}; "
+        f"LIKELY SAFE matches: {safe_count}."
+    )
 
     for finding in findings:
         file_name = str(finding["file"])
         line_no = int(finding["line"])
+        if finding.get("status") == "LIKELY SAFE - has auth check":
+            print(
+                f"[LIKELY SAFE] {file_name}:{line_no} has nearby auth check "
+                f"{finding['auth_check']!r}; not reported as a bug."
+            )
+            continue
         if is_duplicate(slug, file_name, line_no):
             print(f"[duplicate] {file_name}:{line_no} was seen in the last 14 days.")
             continue

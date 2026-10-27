@@ -6,7 +6,7 @@ import re
 from pathlib import Path
 
 
-IGNORE_DIRS = {"vendor", "node_modules", "tests", "test"}
+IGNORE_DIRS = {"vendor", "node_modules", "dist", ".git", "__pycache__", "tests", "test"}
 PRIMARY_DIRECTORIES = {"includes", "admin", "public"}
 AUTH_CHECK_PATTERN = re.compile(
     r"current_user_can|check_ajax_referer|check_admin_referer|"
@@ -90,8 +90,8 @@ def _inspect_file(path: Path, root: Path) -> list[dict[str, object]]:
                 "file": relative_file,
                 "line": line,
                 "type": finding_type,
-            "status": "LIKELY SAFE - has auth check" if auth_check else "REVIEW",
-            "auth_check": auth_check,
+                "status": "LIKELY SAFE - has auth check" if auth_check else "REVIEW",
+                "auth_check": auth_check,
                 "description": description,
                 "evidence": _context(text, line),
                 "poc": "Not generated. Review and validate only in an authorized local test environment.",

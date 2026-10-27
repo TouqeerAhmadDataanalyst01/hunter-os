@@ -7,6 +7,7 @@ import re
 import zipfile
 from pathlib import Path
 
+from analyzer.platform import SUPPORTED_PLATFORMS, detect_platform
 from analyzer.wordpress import scan_plugin
 from duplicate_checker import is_duplicate, record_finding
 from reporter.patchstack import make_report
@@ -33,7 +34,7 @@ def load_targets(path: Path = TARGETS_FILE) -> list[str]:
     return slugs
 
 
-def scan_target(slug: str) -> list[dict[str, object]]:
+def scan_target(slug: str, platform_override: str = "auto") -> list[dict[str, object]]:
     """Scan a local plugin directory or a ZIP already stored in the workspace."""
     if not SLUG_PATTERN.fullmatch(slug):
         print(f"[skip] Invalid plugin slug: {slug!r}")
@@ -46,6 +47,27 @@ def scan_target(slug: str) -> list[dict[str, object]]:
         return []
     if plugin_path is None:
         print(f"[skip] No local source was found for {slug}.")
+        return []
+
+    try:
+        platform = (
+            detect_platform(plugin_path)
+            if platform_override == "auto"
+            else platform_override
+        )
+    except NotADirectoryError as error:
+        print(f"[error] Could not identify platform: {error}")
+        return []
+    if platform is None:
+        print("[skip] Could not detect a supported project platform.")
+        return []
+
+    print(f"[platform] {platform}")
+    if platform != "wordpress":
+        print(
+            f"[manual] Platform detected, but no {platform} security rules are "
+            "implemented. No vulnerability scan was performed."
+        )
         return []
 
     print(f"[scan] Checking local source: {plugin_path}")
@@ -81,9 +103,15 @@ def scan_target(slug: str) -> list[dict[str, object]]:
 def main(argv: list[str] | None = None) -> None:
     parser = argparse.ArgumentParser(description="Scan local WordPress plugin source.")
     parser.add_argument("--target", help="scan only this slug from targets/wordpress.txt")
+    parser.add_argument(
+        "--platform",
+        choices=("auto", *SUPPORTED_PLATFORMS),
+        default="auto",
+        help="detect automatically or select a platform explicitly",
+    )
     args = parser.parse_args(argv)
 
-    print("Hunter OS v2: offline WordPress source review")
+    print("Hunter OS v4: offline project identification and WordPress source review")
     print("No remote downloads, vulnerability-site requests, or exploit requests are made.")
     try:
         slugs = load_targets()
@@ -103,7 +131,7 @@ def main(argv: list[str] | None = None) -> None:
 
     for slug in slugs:
         print(f"\n[target] {slug}")
-        scan_target(slug)
+        scan_target(slug, platform_override=args.platform)
 
     print("\nDone. Heuristic matches require manual verification and authorization.")
 

@@ -34,6 +34,8 @@ The current implementation can:
 - Use source from a local plugin directory or extract a ZIP already stored in the repository.
 - Identify WordPress, Laravel, Django, or Node.js from conventional marker files.
 - Run three existing text-pattern checks on in-scope PHP files for a WordPress project.
+- List checked files and summarize skipped paths, including oversized, unreadable, and out-of-scope sources.
+- Parse a documented subset of PHP into source-located functions, methods, assignments, calls, returns, and conditional branches. This parser is not yet used by vulnerability detection.
 - Ignore common generated and dependency directories.
 - Look for selected authorization-related tokens near a match and record them as context without suppressing the finding.
 - Write Markdown and JSON reports and keep local duplicate history.
@@ -82,7 +84,7 @@ or:
 targets/archives/my-plugin.zip   # ZIP you obtained and saved locally
 ```
 
-The directory source takes precedence if both are present. ZIP extraction happens under `/tmp/plugins/<slug>`. If that extraction directory already exists, it is reused; replacing the ZIP does not automatically refresh the extracted files. Remove that one temporary directory yourself when you need to re-extract a changed archive.
+The directory source takes precedence if both are present. ZIP extraction uses a unique directory below `/tmp/plugins/`; a later scan extracts into a new isolated directory instead of reusing stale content. Hunter OS does not delete earlier extraction directories.
 
 ### Reports
 
@@ -95,12 +97,13 @@ When you run `python main.py --target my-plugin`, the program:
 1. Parses the command-line arguments.
 2. Confirms `my-plugin` appears in `targets/wordpress.txt`.
 3. Looks for `targets/plugins/my-plugin/`, then `targets/archives/my-plugin.zip`.
-4. Extracts a local ZIP if needed, with path traversal and symlink checks.
+4. Extracts a local ZIP if needed, enforcing archive/member/expanded-size limits and path/symlink checks in a new isolated directory.
 5. Detects the project platform unless you chose `--platform` explicitly.
 6. Runs the WordPress PHP heuristics only if the selected platform is `wordpress`.
-7. Prints the potential-finding count and how many matches have a nearby auth token.
-8. Writes JSON for all matches from the current run. A nearby auth token is context, not proof the operation is protected.
-9. Skips duplicate Markdown/history entries recorded in the previous 14 days; new findings are appended to Markdown and recorded in local history.
+7. Prints the count of files checked by the existing heuristics and summarizes files/trees not analyzed, with example paths.
+8. Prints the potential-finding count and how many matches have a nearby auth token.
+9. Writes JSON for all matches from the current run. A nearby auth token is context, not proof the operation is protected.
+10. Skips duplicate Markdown/history entries recorded in the previous 14 days; new findings are appended to Markdown and recorded in local history.
 
 The scanner does not start WordPress or execute plugin code. It reads source as text.
 
@@ -132,6 +135,18 @@ A forced platform changes the platform selection; it does not add rules. For Lar
 ## 7. WordPress Checks and Filters
 
 The analyzer currently considers `.php` files at the project root and beneath `includes/`, `admin/`, and `public/`. It ignores files inside directory components named `vendor`, `node_modules`, `dist`, `.git`, `__pycache__`, `tests`, or `test`. Matching is case-insensitive for directory names. A filename containing the word `vendor` is not excluded unless a parent directory has that name.
+
+### PHP parser foundation
+
+`analyzer/php_parser.py` is an offline, standard-library-only parser foundation. It recognizes named functions, classes and methods, simple assignments, variable references, call expressions, returns, and `if`/`elseif`/`else` branches. It preserves file, line, column, and offset locations. Expression text is retained as a bounded token span with its variable references and recognized calls; it is not a full expression AST.
+
+The supported subset does not include namespaces/imports, class inheritance/interfaces, typed/defaulted/reference/variadic parameters, return types, loops, switch/try constructs, closures/arrow functions, interpolated strings, heredoc/nowdoc, PHP attributes, short echo tags, inline HTML, or PHP-specific statements such as `echo` and `include`. Those constructs produce diagnostics, and any diagnostic makes `Program.complete` false. Malformed delimiters, source/token limits, and unreadable files likewise cannot be reported as a complete parse. Expressions are retained as opaque token spans rather than fully grammar-validated expression trees, so `complete` means no known unsupported construct or structural parse error was encountered—not full PHP syntax validation. This foundation is not yet connected to scanning or vulnerability findings; the existing regex checks remain operational.
+
+### Taint engine foundation (M2)
+
+`analyzer/taint.py` can be called independently with a parsed `Program` and configurable source, sink, sanitizer, and propagator definitions. Its initial registry includes common WordPress request sources, selected SQL/command/file/network call sinks, and context-labeled sanitizer examples. It follows simple and compound variable assignments, nested call arguments/returns, and both sides of `if` branches. It never uses nearby authorization tokens as protection. Context-matched sanitizer evidence marks a flow as mitigated but preserves it in the result; a sanitizer for another context does not. Nonce verification is only labeled as nonce evidence and is not authorization proof.
+
+The engine refuses to analyze a parser result with diagnostics. Its default bounds are 8 nested user-function calls, 100,000 execution steps, 10,000 flows, and 10,000 tainted values per variable. Limit exhaustion retains any partial flows but marks the result incomplete and adds a diagnostic. Unknown calls conservatively propagate tainted arguments. Branches are merged without proving conditions, and functions are examined independently because framework entry points are not implemented. Complex PHP expressions, aliases, and cross-file calls are not modeled. This engine is not yet wired into the scanner and does not add or confirm vulnerability findings; the V4 regex checks remain the only active CLI detectors.
 
 Each source file is limited to 2 MB. The current text heuristics look for:
 
@@ -247,12 +262,13 @@ Check the CLI output for a duplicate. Also confirm the PHP file is within the pe
 
 ### ZIP extraction errors
 
-Use a valid local ZIP and check for suspicious archive paths, symlinks, oversized archives, or oversized individual files. The extractor intentionally rejects unsafe members.
+Use a valid local ZIP and check for suspicious archive paths, symlinks, oversized archives, or oversized individual files. Extraction is limited to 100 MB compressed input, 10,000 members, 20 MB per member, and 200 MB total expanded data; the extractor streams files and rejects unsafe members.
 
 ## 13. Limitations and Safe Use
 
 - V4 identifies WordPress, Laravel, Django, and Node.js, but only WordPress has source heuristics today.
-- The current checks are regular expressions, not language parsers or complete static analysis.
+- The current vulnerability checks remain regular expressions, not data-flow analysis. The separate PHP parser supports only a documented subset and is not a complete PHP AST.
+- The M2 taint engine is a standalone analysis foundation, not a scanner detector. Its flows are conservative evidence, not proof of exploitability or authorization failure.
 - `LIKELY SAFE` is not proof of safety; absence of a match is not proof that the project is secure.
 - The scanner analyzes local source only and does not execute it, contact external services, or validate behavior in a running application.
 - The project does not generate exploit requests, assign bounty values, or produce verified severity scores.

@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+import os
 import re
+from dataclasses import dataclass, field
 from pathlib import Path
 
 
@@ -14,6 +16,13 @@ AUTH_CHECK_PATTERN = re.compile(
     re.IGNORECASE,
 )
 MAX_SOURCE_BYTES = 2_000_000
+
+
+@dataclass
+class ScanSummary:
+    findings: list[dict[str, object]] = field(default_factory=list)
+    scanned_files: int = 0
+    skipped: list[dict[str, str]] = field(default_factory=list)
 
 
 def _line_for(text: str, offset: int) -> int:
@@ -45,13 +54,15 @@ def _auth_check_before(text: str, offset: int) -> str | None:
     return match.group(0) if match else None
 
 
-def _inspect_file(path: Path, root: Path) -> list[dict[str, object]]:
+def _inspect_file(
+    path: Path, root: Path
+) -> tuple[list[dict[str, object]], str | None]:
     try:
         if path.stat().st_size > MAX_SOURCE_BYTES:
-            return []
+            return [], "oversized"
         text = path.read_text(encoding="utf-8", errors="replace")
     except OSError:
-        return []
+        return [], "unreadable"
 
     relative_file = path.relative_to(root).as_posix()
     findings: list[dict[str, object]] = []
@@ -101,7 +112,7 @@ def _inspect_file(path: Path, root: Path) -> list[dict[str, object]]:
             }
         )
 
-    return findings
+    return findings, None
 
 
 def scan_plugin(path: str | Path) -> list[dict[str, object]]:
@@ -110,14 +121,82 @@ def scan_plugin(path: str | Path) -> list[dict[str, object]]:
     The checks are intentionally limited to source inspection: they make no
     network requests and do not claim that a match is an exploitable bug.
     """
+    return scan_plugin_with_summary(path).findings
+
+
+def scan_plugin_with_summary(path: str | Path) -> ScanSummary:
+    """Run the existing heuristics and return visible file dispositions."""
     root = Path(path).expanduser().resolve()
     if not root.is_dir():
         raise NotADirectoryError(f"Plugin source directory not found: {root}")
 
-    findings: list[dict[str, object]] = []
-    for source_file in list_scan_files(root):
-        findings.extend(_inspect_file(source_file, root))
-    return findings
+    summary = ScanSummary()
+    walk_errors: list[OSError] = []
+
+    def record_walk_error(error: OSError) -> None:
+        walk_errors.append(error)
+
+    candidates: list[Path] = []
+    for current, directories, filenames in os.walk(
+        root, topdown=True, followlinks=False, onerror=record_walk_error
+    ):
+        current_path = Path(current)
+        retained_directories: list[str] = []
+        for directory in sorted(directories):
+            directory_path = current_path / directory
+            relative = directory_path.relative_to(root).as_posix()
+            if directory_path.is_symlink():
+                summary.skipped.append(
+                    {"path": relative, "reason": "symbolic-link directory"}
+                )
+            elif directory.lower() in IGNORE_DIRS:
+                summary.skipped.append(
+                    {"path": f"{relative}/**", "reason": "out of scan scope"}
+                )
+            elif current_path == root and directory.lower() not in PRIMARY_DIRECTORIES:
+                summary.skipped.append(
+                    {"path": f"{relative}/**", "reason": "out of scan scope"}
+                )
+            else:
+                retained_directories.append(directory)
+        directories[:] = retained_directories
+
+        for filename in sorted(filenames):
+            source_file = current_path / filename
+            relative = source_file.relative_to(root).as_posix()
+            if source_file.is_symlink():
+                summary.skipped.append(
+                    {"path": relative, "reason": "symbolic link"}
+                )
+            elif _is_in_scan_scope(source_file, root):
+                candidates.append(source_file)
+            else:
+                summary.skipped.append(
+                    {"path": relative, "reason": "out of scan scope"}
+                )
+
+    for error in walk_errors:
+        try:
+            relative = Path(error.filename or root).relative_to(root).as_posix()
+        except ValueError:
+            relative = str(error.filename or root)
+        summary.skipped.append(
+            {"path": relative, "reason": "unreadable directory"}
+        )
+
+    for source_file in sorted(candidates):
+        findings, skip_reason = _inspect_file(source_file, root)
+        if skip_reason is not None:
+            summary.skipped.append(
+                {
+                    "path": source_file.relative_to(root).as_posix(),
+                    "reason": skip_reason,
+                }
+            )
+            continue
+        summary.scanned_files += 1
+        summary.findings.extend(findings)
+    return summary
 
 
 def list_scan_files(path: str | Path) -> list[Path]:

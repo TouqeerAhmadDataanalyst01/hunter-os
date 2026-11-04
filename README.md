@@ -2,6 +2,8 @@
 
 Hunter OS is an offline source-review tool. It can identify WordPress, Laravel, Django, and Node.js project markers. **Only WordPress PHP heuristics are implemented**; the other platforms are identified but skipped without a security scan.
 
+The repository also contains an experimental, bounded PHP parser foundation for a documented syntax subset and a standalone taint engine over its intermediate representation. Neither is connected to the vulnerability checks, and the parser does not claim complete PHP AST support. The existing regex-based WordPress checks remain the active detectors.
+
 Use Python 3.10 or newer. No packages or API keys are needed. Source must already exist in `targets/plugins/<slug>/` or `targets/archives/<slug>.zip`; the program never downloads targets or contacts vulnerability databases.
 
 ```bash

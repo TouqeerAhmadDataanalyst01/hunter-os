@@ -9,7 +9,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from analyzer.platform import SUPPORTED_PLATFORMS, detect_platform
-from analyzer.wordpress import list_scan_files, scan_plugin
+from analyzer.wordpress import list_scan_files, scan_plugin, scan_plugin_with_summary
 from duplicate_checker import is_duplicate, record_finding
 from reporter.json_report import write_json_report
 from reporter.patchstack import make_report
@@ -96,7 +96,18 @@ def scan_target(
         return ScanResult([], 0)
 
     print(f"[scan] Checking local source: {plugin_path}")
-    findings = scan_plugin(plugin_path)
+    summary = scan_plugin_with_summary(plugin_path)
+    findings = summary.findings
+    print(f"[scan] Source files checked by the existing heuristics: {summary.scanned_files}")
+    skipped_by_reason: dict[str, list[str]] = {}
+    for skipped in summary.skipped:
+        skipped_by_reason.setdefault(skipped["reason"], []).append(skipped["path"])
+    for reason, paths in sorted(skipped_by_reason.items()):
+        print(f"[scan] Not analyzed ({reason}): {len(paths)} path(s)")
+        for skipped_path in paths[:5]:
+            print(f"  {skipped_path}")
+        if len(paths) > 5:
+            print(f"  ... and {len(paths) - 5} more")
     auth_count = sum(bool(finding.get("auth_present")) for finding in findings)
     print(
         f"[scan] Potential findings: {len(findings)}; "

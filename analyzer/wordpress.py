@@ -29,9 +29,11 @@ from analyzer.frameworks.wordpress import (
     resolve_entrypoint_callbacks,
 )
 from analyzer.taint import (
+    DEFAULT_SOURCES,
     DEFAULT_SANITIZERS,
     TaintAnalysisResult,
     TaintFlow,
+    TaintSource,
     analyze_program,
 )
 
@@ -503,7 +505,15 @@ def _finding_from_flow(
             flow.context, f"Tainted data reaches {flow.context} sink {flow.sink.name}"
         ),
         "status": "POTENTIAL",
-        "confidence": "medium",
+        "confidence": (
+            "high"
+            if flow.context == "html"
+            and not flow.sanitizers
+            and bool(flow.trace)
+            and flow.trace[-1].kind == "sink"
+            and all(step.kind == "assignment" for step in flow.trace[:-1])
+            else "medium"
+        ),
         "context": flow.context,
         "function": _function_name_for_location(program, flow.sink.location),
         "source": source,
@@ -740,7 +750,11 @@ def _wordpress_framework_findings(
             nonce_note = (
                 " Nonce verification is not authorization proof; nonce is not auth."
                 if nonce_evidence and not auth_evidence
-                else ""
+                else (
+                    " missing current_user_can authorization proof."
+                    if not auth_evidence
+                    else ""
+                )
             )
             line = sensitive_call.location.line
             findings.append(
@@ -802,6 +816,12 @@ def _wordpress_framework_findings(
                 and call.location.offset == flow.sink.location.offset
                 for call in function_calls
             )
+            or any(
+                isinstance(statement, OutputStatement)
+                and statement.location.file == flow.sink.location.file
+                and statement.location.offset == flow.sink.location.offset
+                for statement in _walk_statements(function_body)
+            )
         ]
         if not route_flows:
             continue
@@ -825,13 +845,7 @@ def _wordpress_framework_findings(
         )
         if auth_evidence:
             continue
-        sink_call = next(
-            call
-            for call in function_calls
-            if call.location.file == flow.sink.location.file
-            and call.location.offset == flow.sink.location.offset
-        )
-        line = sink_call.location.line
+        line = flow.sink.location.line
         findings.append(
             {
                 "file": relative_file,
@@ -847,7 +861,7 @@ def _wordpress_framework_findings(
                     "line": flow.source.location.line,
                 },
                 "sink": {
-                    "name": sink_call.name,
+                    "name": flow.sink.name,
                     "file": relative_file,
                     "line": line,
                 },
@@ -1066,7 +1080,17 @@ def _analyze_taint_file(
         framework_auth = _framework_authorization_evidence(
             entry_points, functions, relative_file
         )
-        analysis: TaintAnalysisResult = analyze_program(program)
+        rest_request_sources = tuple(
+            TaintSource(function.parameters[0])
+            for entry_point, function in resolve_entrypoint_callbacks(
+                entry_points, functions
+            )
+            if entry_point.kind == "rest" and function.parameters
+        )
+        analysis: TaintAnalysisResult = analyze_program(
+            program,
+            sources=DEFAULT_SOURCES + rest_request_sources,
+        )
         if not analysis.complete:
             result.complete = False
             result.diagnostics.extend(
@@ -1089,26 +1113,38 @@ def _analyze_taint_file(
                     "incomplete_taint",
                 )
             )
-        for flow in analysis.flows:
-            result.findings.append(
-                _finding_from_flow(
-                    flow,
-                    _auth_evidence_for_flow(
-                        program, flow, relative_file, framework_auth
-                    ),
-                    relative_file,
-                    program,
-                )
-            )
-        result.findings.extend(
-            _wordpress_framework_findings(
-                program,
+        flow_findings = [
+            _finding_from_flow(
+                flow,
+                _auth_evidence_for_flow(
+                    program, flow, relative_file, framework_auth
+                ),
                 relative_file,
-                analysis.flows,
-                entry_points,
-                framework_auth,
+                program,
+            )
+            for flow in analysis.flows
+        ]
+        framework_findings = _wordpress_framework_findings(
+            program,
+            relative_file,
+            analysis.flows,
+            entry_points,
+            framework_auth,
+        )
+        ajax_sink_lines = {
+            (finding["file"], finding["line"])
+            for finding in framework_findings
+            if finding["type"] == "Unauthenticated WordPress AJAX Action"
+        }
+        result.findings.extend(
+            finding
+            for finding in flow_findings
+            if not (
+                finding.get("context") == "sensitive_action"
+                and (finding.get("file"), finding.get("line")) in ajax_sink_lines
             )
         )
+        result.findings.extend(framework_findings)
         _annotate_entry_points(
             program, result.findings, relative_file, entry_points
         )
@@ -1133,10 +1169,8 @@ def _analyze_taint_file(
         )
 
 
-def scan_php_file_with_taint(
-    path: str | Path,
-) -> tuple[ScanSummary, TaintScanSummary]:
-    """Scan one explicitly supplied PHP file without changing plugin scan scope."""
+def scan_php_file_with_summary(path: str | Path) -> ScanSummary:
+    """Run only the existing V4 checks against one explicitly supplied PHP file."""
     supplied_path = Path(path).expanduser()
     if supplied_path.is_symlink():
         raise ValueError(f"Refusing to scan a symbolic link: {supplied_path}")
@@ -1155,6 +1189,15 @@ def scan_php_file_with_taint(
         regex_summary.skipped.append(
             {"path": source_file.name, "reason": skip_reason}
         )
+    return regex_summary
+
+
+def scan_php_file_with_taint(
+    path: str | Path,
+) -> tuple[ScanSummary, TaintScanSummary]:
+    """Run existing V4 checks and opt-in taint analysis against one PHP file."""
+    source_file = Path(path).expanduser().resolve()
+    regex_summary = scan_php_file_with_summary(path)
     taint_summary = TaintScanSummary()
     _analyze_taint_file(source_file, source_file.name, taint_summary)
     taint_summary.audit = _judge_taint_findings(taint_summary.findings)

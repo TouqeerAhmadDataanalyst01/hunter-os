@@ -20,6 +20,7 @@ from analyzer.wordpress import (
     scan_plugin_with_summary,
     scan_plugin_with_taint,
     scan_php_file_with_taint,
+    scan_php_file_with_summary,
     TaintScanSummary,
     _incomplete_finding,
 )
@@ -42,6 +43,25 @@ DEFAULT_SCAN_TIMEOUT_SECONDS = 120
 class ScanResult:
     findings: list[dict[str, object]]
     exit_code: int
+
+
+def _legacy_json_records(
+    findings: list[dict[str, object]], platform: str = "wordpress"
+) -> list[dict[str, object]]:
+    return [
+        {
+            "file": finding["file"],
+            "line": finding["line"],
+            "type": finding["type"],
+            "confidence": finding.get("confidence", "LOW"),
+            "auth_present": bool(finding.get("auth_present")),
+            "manual_verification_required": True,
+            "platform": platform,
+            "status": finding.get("status", "POTENTIAL"),
+            "evidence": finding.get("evidence", ""),
+        }
+        for finding in findings
+    ]
 
 
 def load_targets(path: Path = TARGETS_FILE) -> list[str]:
@@ -440,27 +460,20 @@ def main(argv: list[str] | None = None) -> int:
             )
             return result.exit_code
         if args.engine != "taint":
-            print("[error] A direct PHP file requires --engine=taint.")
-            return 2
+            try:
+                regex_summary = scan_php_file_with_summary(requested_path)
+            except (OSError, ValueError) as error:
+                print(f"[error] Could not scan PHP source: {error}")
+                return 2
+            records = _legacy_json_records(regex_summary.findings)
+            print(json.dumps(records, indent=2))
+            return 1 if records else 0
         try:
             regex_summary, taint_summary = scan_php_file_with_taint(args.source_file)
         except (OSError, ValueError) as error:
             print(f"[error] Could not scan PHP source: {error}")
             return 2
-        records = [
-            {
-                "file": finding["file"],
-                "line": finding["line"],
-                "type": finding["type"],
-                "confidence": finding.get("confidence", "LOW"),
-                "auth_present": bool(finding.get("auth_present")),
-                "manual_verification_required": True,
-                "platform": "wordpress",
-                "status": finding.get("status", "POTENTIAL"),
-                "evidence": finding.get("evidence", ""),
-            }
-            for finding in regex_summary.findings
-        ]
+        records = _legacy_json_records(regex_summary.findings)
         active_taint_findings = [
             finding
             for finding in taint_summary.findings

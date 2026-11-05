@@ -12,6 +12,8 @@ from unittest.mock import patch
 
 from analyzer.wordpress import MAX_SOURCE_BYTES, scan_plugin, scan_plugin_with_summary
 from analyzer.php_parser import (
+    CallStatement,
+    GlobalStatement,
     MAX_NESTED_CALLS,
     OutputStatement,
     parse_php,
@@ -381,16 +383,20 @@ class PhpParserTests(unittest.TestCase):
         self.assertFalse(malformed_expression.complete)
         self.assertFalse(unterminated_string.complete)
 
-    def test_inline_html_and_interpolated_strings_are_explicitly_incomplete(self) -> None:
+    def test_inline_html_and_complex_interpolation_are_explicitly_incomplete(self) -> None:
         inline_html = parse_php("<p>HTML</p><?php $value = 1;")
         self.assertFalse(inline_html.complete)
         self.assertTrue(any(item.code == "inline_html" for item in inline_html.diagnostics))
 
         interpolated = parse_php('<?php $value = "$name";')
-        self.assertFalse(interpolated.complete)
-        self.assertTrue(
-            any(item.code == "unsupported_interpolation" for item in interpolated.diagnostics)
-        )
+        self.assertTrue(interpolated.complete, interpolated.diagnostics)
+        self.assertEqual(interpolated.statements[0].value.variables, ("$name",))
+        complex_interpolation = parse_php('<?php $value = "{$user->name}";')
+        self.assertFalse(complex_interpolation.complete)
+        self.assertTrue(any(
+            item.code == "unsupported_interpolation"
+            for item in complex_interpolation.diagnostics
+        ))
         embedded_tag = parse_php("<?php $value = '<?php';")
         self.assertTrue(embedded_tag.complete, embedded_tag.diagnostics)
 
@@ -408,6 +414,26 @@ class PhpParserTests(unittest.TestCase):
         )
         self.assertFalse(nested_calls.complete)
 
+    def test_global_and_parenthesized_include_are_source_located(self) -> None:
+        program = parse_php(
+            "<?php function query(){ global $wpdb; "
+            "$wpdb->query(\"SELECT id=$id\"); } "
+            "$file = $_GET['file']; include($file);",
+            "real.php",
+        )
+
+        self.assertTrue(program.complete, program.diagnostics)
+        self.assertIsInstance(program.functions[0].body[0], GlobalStatement)
+        query = program.functions[0].body[1].expression.calls[0]
+        self.assertEqual(query.argument_variables, (("$id",),))
+        include_statement = program.statements[1]
+        self.assertIsInstance(include_statement, CallStatement)
+        self.assertEqual(include_statement.expression.calls[0].name, "include")
+        self.assertEqual(
+            include_statement.expression.calls[0].argument_variables,
+            (("$file",),),
+        )
+
 
 class TaintAnalysisTests(unittest.TestCase):
     sources = (TaintSource("$_GET"), TaintSource("$_POST"))
@@ -418,6 +444,17 @@ class TaintAnalysisTests(unittest.TestCase):
         options: dict[str, object] = {"sources": self.sources, "sinks": self.sinks}
         options.update(kwargs)
         return analyze_program(program, **options)
+
+    def test_default_wordpress_superglobal_sources_reach_output(self) -> None:
+        for source in ("$_GET", "$_POST", "$_REQUEST", "$_COOKIE", "$_FILES"):
+            with self.subTest(source=source):
+                result = analyze_program(
+                    parse_php(f"<?php echo {source}['value'];", "sources.php"),
+                    sinks=(TaintSink("echo", "html"),),
+                )
+                self.assertTrue(result.complete)
+                self.assertEqual(len(result.flows), 1)
+                self.assertEqual(result.flows[0].source.name, source)
 
     def test_tracks_source_through_assignments_calls_and_sink(self) -> None:
         result = self.analyze(

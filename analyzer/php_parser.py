@@ -119,12 +119,7 @@ _UNSUPPORTED_STATEMENTS = {
     "trait",
     "enum",
     "const",
-    "global",
     "static",
-    "include",
-    "include_once",
-    "require",
-    "require_once",
     "yield",
     "break",
     "continue",
@@ -142,10 +137,6 @@ _UNSUPPORTED_EXPRESSION_KEYWORDS = {
     "fn",
     "match",
     "yield",
-    "include",
-    "include_once",
-    "require",
-    "require_once",
     "eval",
     "new",
     "clone",
@@ -218,6 +209,12 @@ class ReturnStatement:
 
 
 @dataclass(frozen=True)
+class GlobalStatement:
+    variables: tuple[str, ...]
+    location: SourceLocation
+
+
+@dataclass(frozen=True)
 class IfStatement:
     condition: Expression
     then_body: tuple[Statement, ...]
@@ -225,7 +222,14 @@ class IfStatement:
     location: SourceLocation
 
 
-Statement = Assignment | CallStatement | OutputStatement | ReturnStatement | IfStatement
+Statement = (
+    Assignment
+    | CallStatement
+    | OutputStatement
+    | ReturnStatement
+    | GlobalStatement
+    | IfStatement
+)
 
 
 @dataclass(frozen=True)
@@ -394,9 +398,9 @@ class _Lexer:
                 value = source[cursor:end]
                 if not closed:
                     self._diagnose("Unterminated string literal", cursor, "malformed_source")
-                elif character == '"' and "$" in value:
+                elif character == '"' and self._has_complex_interpolation(value):
                     self._diagnose(
-                        "Interpolated double-quoted strings are not modeled",
+                        "Complex interpolated double-quoted strings are not modeled",
                         cursor,
                         "unsupported_interpolation",
                     )
@@ -456,6 +460,16 @@ class _Lexer:
                 )
                 return tokens
         return tokens
+
+    @staticmethod
+    def _has_complex_interpolation(value: str) -> bool:
+        inner = value[1:-1]
+        if re.search(r"(?<!\\)\$\{|\{[^}]*\$[A-Za-z_]", inner):
+            return True
+        return re.search(
+            r"(?<!\\)\$[A-Za-z_][A-Za-z0-9_]*(?:\[|->|\?->)",
+            inner,
+        ) is not None
 
     def _consume_quoted(self, start: int, quote: str) -> tuple[int, bool]:
         cursor = start + 1
@@ -745,6 +759,8 @@ class _Parser:
             return self._parse_if()
         if keyword == "return":
             return self._parse_return()
+        if keyword == "global":
+            return self._parse_global()
         if keyword in {"echo", "print"}:
             return self._parse_output()
         if keyword in _UNSUPPORTED_CONTROLS:
@@ -768,6 +784,23 @@ class _Parser:
             self._skip_statement()
             return None
         return self._parse_expression_statement()
+
+    def _parse_global(self) -> GlobalStatement:
+        start = self._take()
+        assert start is not None
+        tokens = self._read_until_semicolon()
+        segments = self._split_top_level(tokens, ",")
+        if not tokens or any(
+            len(segment) != 1 or segment[0].kind != "variable"
+            for segment in segments
+        ):
+            self._diagnose("Global statement requires variables", start, "parser_error")
+        variables = tuple(
+            segment[0].value
+            for segment in segments
+            if len(segment) == 1 and segment[0].kind == "variable"
+        )
+        return GlobalStatement(variables, self.location(start.start))
 
     def _parse_if(self) -> IfStatement | None:
         start = self._take()
@@ -942,15 +975,31 @@ class _Parser:
                 )
         return Expression(
             self._text(tokens),
-            tuple(token.value for token in tokens if token.kind == "variable"),
+            tuple(value for value, _ in self._variables_in_tokens(tokens)),
             tuple(self._find_calls(tokens)),
             self.location(offset),
-            tuple(
-                self.location(token.start)
-                for token in tokens
-                if token.kind == "variable"
-            ),
+            tuple(location for _, location in self._variables_in_tokens(tokens)),
         )
+
+    def _variables_in_tokens(
+        self, tokens: list[_Token]
+    ) -> list[tuple[str, SourceLocation]]:
+        variables: list[tuple[str, SourceLocation]] = []
+        for token in tokens:
+            if token.kind == "variable":
+                variables.append((token.value, self.location(token.start)))
+            elif token.kind == "string" and token.value.startswith('"'):
+                for match in re.finditer(
+                    r"(?<!\\)\$[A-Za-z_][A-Za-z0-9_]*",
+                    token.value[1:-1],
+                ):
+                    variables.append(
+                        (
+                            match.group(0),
+                            self.location(token.start + 1 + match.start()),
+                        )
+                    )
+        return variables
 
     def _find_calls(self, tokens: list[_Token], depth: int = 0) -> list[Call]:
         if depth > MAX_NESTED_CALLS:
@@ -1002,30 +1051,25 @@ class _Parser:
                 tuple(self._find_calls(segment, depth + 1))
                 for segment in argument_segments
             )
-            argument_variables = tuple(
-                tuple(
-                    token.value
-                    for token in segment
-                    if token.kind == "variable"
-                    and not any(
-                        child.location.offset <= token.start < child.end_offset
-                        for child in argument_calls[index]
+            argument_variables_list: list[tuple[str, ...]] = []
+            argument_variable_locations_list: list[tuple[SourceLocation, ...]] = []
+            for argument_index, segment in enumerate(argument_segments):
+                direct_variables = [
+                    (value, location)
+                    for value, location in self._variables_in_tokens(segment)
+                    if not any(
+                        child.location.offset <= location.offset < child.end_offset
+                        for child in argument_calls[argument_index]
                     )
+                ]
+                argument_variables_list.append(
+                    tuple(value for value, _ in direct_variables)
                 )
-                for index, segment in enumerate(argument_segments)
-            )
-            argument_variable_locations = tuple(
-                tuple(
-                    self.location(token.start)
-                    for token in segment
-                    if token.kind == "variable"
-                    and not any(
-                        child.location.offset <= token.start < child.end_offset
-                        for child in argument_calls[index]
-                    )
+                argument_variable_locations_list.append(
+                    tuple(location for _, location in direct_variables)
                 )
-                for index, segment in enumerate(argument_segments)
-            )
+            argument_variables = tuple(argument_variables_list)
+            argument_variable_locations = tuple(argument_variable_locations_list)
             calls.append(
                 Call(
                     self._text(tokens[start_index : index + 1]),

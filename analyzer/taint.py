@@ -147,6 +147,10 @@ DEFAULT_SINKS = (
         "fopen",
         "readfile",
         "unlink",
+        "include",
+        "include_once",
+        "require",
+        "require_once",
     )),
     *(TaintSink(name, "network_url") for name in (
         "wp_remote_get",

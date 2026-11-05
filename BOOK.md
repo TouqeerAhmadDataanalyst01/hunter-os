@@ -149,6 +149,8 @@ The parser still does not build a complete expression tree or model all PHP gram
 
 The engine refuses to analyze a parser result with diagnostics. Its bounds include 3 nested user-function calls, 100,000 execution steps, 10,000 flows, and 10,000 tainted values per variable. Limit exhaustion retains any partial flows but marks the result incomplete and adds a diagnostic and audit entry. Unknown calls conservatively propagate tainted arguments. Same-program object property assignments and no-argument method returns are tracked within the same three-call-depth limit. A narrow cross-file WordPress query-builder check reports an audit entry when tainted fields are assigned to `$query->fields`, passed through a schema-derived `SHOW COLUMNS`/`array_search` allowlist, and then used by a no-argument `Query::build()` result at a database read sink; this recognizes the WP Google Maps 7.11.18 fix pattern, not arbitrary object state or arbitrary allowlist logic. WordPress `apply_filters()` is modeled as returning only its filtered value (the second argument); filter callbacks are not resolved, so callback modifications to that value are not modeled. Branches and loop bodies are merged conservatively without proving conditions or modeling iteration counts; general cross-file calls and heap/object-property state are not modeled, so other values built on objects and later emitted by methods may be missed. The CLI's default `--engine=regex` path retains the V4 JSON list and report behavior; `--engine=taint` runs regex and taint analysis and writes a JSON object with the unchanged V4 records under `findings`, active V5 results under `v5_taint_findings`, and downgraded/incomplete results with evidence under `v5_audit`. Every V5 result includes confidence and its reason, a source trace, sanitizer/auth evidence lists, an entry-point label, and a review note. A single PHP file can be scanned directly with either engine; both forms write JSON to stdout and do not update plugin report history. Directories and local ZIP archives can be scanned as a mass-scan input; this path accepts at most 10,000 PHP files and uses existing ZIP safety limits. The taint scan has a whole-scan timeout and a cooperative 5-second per-file warning budget; neither can forcibly interrupt Python analysis already in progress.
 
+For SQL flow review, the scanner recognizes literal `$wpdb->prepare()` formats with sufficient bound values, generated placeholder lists only when `array_fill()` repeats a literal placeholder using the bound array's count, and conditional WHERE arrays only when each fixed placeholder fragment is paired with a bound value. It also recognizes fixed string-map SQL identifier validators and strict `in_array()` enum validators, plus small same-function query builders that return only static fragments and prepared chunks joined by `implode()`. These are deliberately narrow syntactic proofs; variable SQL formats, custom query-building semantics, and complex allowlists remain active for manual review.
+
 The judge downgrades but preserves evidence when a sanitizer is effective for that sink context or when a recognized `current_user_can()`/`user_can()` condition guards the sink in the same function. It recognizes a sink inside the permission-true branch, or a sink after a negated permission check whose denied branch terminates. This limited check does not prove permission sufficiency, complete control-flow dominance, or framework callback policy. Nonce checks are not authorization proof. Downgrades are copied to `v5_audit`; incomplete parses are emitted as low-confidence findings with an explicit `incomplete parse` note.
 
 ### Opt-in detector rules (M4)
@@ -166,6 +168,40 @@ The `--engine=taint` path currently maps flows to these potential finding catego
 The renderer presents each active finding in owner-readable form: file and line, confidence with reason, entry-point label, a compact source-to-sink trace, one-line explanation, remediation suggestion, and sanitizer/auth evidence. Rejected or incomplete cases remain in the `v5_audit` section rather than disappearing.
 
 Downgraded taint and AJAX findings are not included in the active `v5_taint_findings` list, but remain visible with their evidence in `v5_audit`. V4 records are preserved independently in the `findings` field. Taint-mode Markdown renders active traces and downgraded audit evidence separately.
+
+### 25-plugin benchmark (2026-11-05)
+
+The benchmark downloaded each latest-stable ZIP from `downloads.wordpress.org`, extracted it with the repository's bounded ZIP extractor, then ran V4 regex and V5 taint scans locally. No plugin code was executed. Each time is combined sequential V4+V5 elapsed time. “V5 active” excludes downgraded and incomplete records; “V5 audit” includes downgraded and incomplete records; incomplete files are counted once per plugin. Across 2,168 eligible PHP files, the run took 49.73 seconds and produced 18 V4 findings, 69 active V5 findings, 1,721 audit records, and 887 incomplete-file instances. The V4 finding records matched the pre-tuning results exactly for all 25 plugins.
+
+| Plugin | Version | V4 | V5 active | V5 audit | Incomplete files | Time (s) |
+|---|---:|---:|---:|---:|---:|---:|
+| Advanced Custom Fields | 6.8.11 | 7 | 0 | 131 | 131 | 4.08 |
+| Akismet | 5.7.2 | 0 | 2 | 6 | 6 | 0.31 |
+| All in One SEO | 5.0.5 | 0 | 0 | 0 | 0 | 0.12 |
+| Classic Editor | 1.7.0 | 0 | 0 | 1 | 1 | 0.06 |
+| Code Snippets | 4.0.0 | 0 | 0 | 0 | 0 | 0.06 |
+| Contact Form 7 | 6.2.4.1 | 2 | 0 | 20 | 20 | 1.11 |
+| Duplicate Post | 4.7 | 0 | 0 | 0 | 0 | 0.10 |
+| Elementor | 4.3.6 | 2 | 0 | 85 | 85 | 3.71 |
+| Health Check & Troubleshooting | 1.7.1 | 0 | 0 | 1 | 1 | 0.02 |
+| Hello Dolly | 1.7.2 | 0 | 0 | 0 | 0 | 0.01 |
+| Jetpack | 16.4 | 3 | 0 | 13 | 13 | 1.78 |
+| Limit Login Attempts Reloaded | 3.4.0 | 0 | 0 | 1 | 1 | 0.09 |
+| Query Monitor | 4.1.1 | 0 | 0 | 0 | 0 | 0.02 |
+| Really Simple Security | 9.8.4 | 0 | 0 | 15 | 15 | 0.51 |
+| Redirection | 5.10.1 | 0 | 0 | 50 | 46 | 1.76 |
+| Regenerate Thumbnails | 3.1.6 | 0 | 0 | 4 | 2 | 0.12 |
+| Rank Math SEO | 1.0.281 | 1 | 23 | 731 | 135 | 8.14 |
+| TablePress | 3.4.1 | 0 | 0 | 1 | 1 | 0.12 |
+| UpdraftPlus | 1.26.14 | 0 | 3 | 61 | 61 | 4.37 |
+| WooCommerce | 11.2.2 | 0 | 31 | 506 | 283 | 17.74 |
+| Wordfence Security | 9.0.2 | 0 | 0 | 1 | 1 | 0.06 |
+| WP Go Maps | 10.1.10 | 2 | 4 | 50 | 41 | 2.19 |
+| WP Mail SMTP | 4.10.3 | 0 | 0 | 2 | 2 | 0.14 |
+| WP Super Cache | 3.1.5 | 0 | 0 | 2 | 2 | 0.25 |
+| WPForms Lite | 2.0.3.1 | 1 | 6 | 40 | 40 | 2.88 |
+
+Manual review of the pre-tuning active SQL/XSS flow records found 197/197 SQL records to be false positives (100% observed false-positive proportion): WordPress prepared query fragments/arrays and fixed SQL order-by allowlists were not being recognized. The two narrow proofs above now downgrade all 197 and retain them in audit; the final run has zero active SQL findings. Of 14 pre-tuning XSS records, 13/14 (92.9%) were confirmed false positives: WooCommerce's `wp_kses_post()` output, an `esc_attr()` ternary, and numeric `wc_price()` output. One Rank Math JSON-encoding response remains an unclassified XSS-context candidate. These rates count source-to-sink flow records, not distinct vulnerabilities; this small convenience sample is not a population-wide estimate or exploitability test. `yoast-seo` returned 404 from the latest-stable download endpoint, so Rank Math was used as the SEO-plugin sample instead.
 
 ### WordPress framework entry points (M5)
 

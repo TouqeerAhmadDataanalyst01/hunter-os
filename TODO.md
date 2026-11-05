@@ -29,12 +29,12 @@
 
 ## M4: New detectors using taint
 
-- [ ] M4: New detectors using taint: SQLi, XSS (echo/print), RCE / command injection, LFI / path traversal, SSRF, unauthenticated sensitive actions
-  - **Goal:** Add separately tested detector rules on top of reliable taint paths and sink contexts.
-  - **Files to touch:** `analyzer/detectors/` (new), parser only for required syntax extensions, `tests/fixtures/`, `tests/test_scanner.py`, `BOOK.md`.
-  - **Tests to add:** Positive, negative, sanitizer, authorization, malformed-source, and false-positive regression fixtures per detector; cross-function/file coverage where supported.
-  - **Done criteria:** Each detector has explicit source/sink/context rules, test evidence, and truthful limitations; no detector treats a keyword-only match as proof.
-  - **Risks:** Context confusion, incomplete language modeling, unsupported output/control syntax, and false-positive/false-negative tradeoffs.
+- [x] M4: New detectors using taint: SQLi, XSS (echo/print), RCE / command injection, LFI / path traversal, SSRF, unauthenticated sensitive actions
+  - **Goal:** Add source-to-sink XSS, SQLi, command injection, SSRF, upload, and path findings; check public WordPress AJAX callbacks and high-confidence hardcoded secrets without treating keyword-only matches as taint proof.
+  - **Files touched:** `analyzer/php_parser.py`, `analyzer/taint.py`, `analyzer/detectors.py`, `analyzer/wordpress.py`, `main.py`, `tests/test_scanner.py`, `tests/test_v4_multi.py`, `BOOK.md`, `README.md`.
+  - **Tests added:** Real-file end-to-end inputs for XSS, SQLi, AJAX auth, upload, traversal, secrets, command injection, and SSRF; sanitizer downgrade/audit, nonce-not-auth, guarded AJAX, upload-reference-only, unrelated file path, placeholder/comment-secret false positives, and echo/print parser location/malformed-input regressions.
+  - **Done criteria:** All listed detector paths have explicit source/sink behavior and expected-output regressions; downgraded results remain in `v5_audit`; regex-mode V4 output remains compatible; limitations are documented.
+  - **Risks:** The parser is still a PHP subset; AJAX callback support is literal/direct only, file boundaries and upload policies are not fully proven, and secret patterns are intentionally narrow.
 
 ## M5: Framework analysis
 

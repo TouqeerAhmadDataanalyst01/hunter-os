@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import json
 import re
 import zipfile
 from dataclasses import dataclass
@@ -14,6 +15,7 @@ from analyzer.wordpress import (
     scan_plugin,
     scan_plugin_with_summary,
     scan_plugin_with_taint,
+    scan_php_file_with_taint,
 )
 from duplicate_checker import is_duplicate, record_finding
 from reporter.json_report import write_json_report
@@ -126,8 +128,13 @@ def scan_target(
     if taint_summary is None:
         json_path = write_json_report(slug, platform, findings, report_root)
     else:
+        active_taint_findings = [
+            finding
+            for finding in taint_summary.findings
+            if finding.get("status") != "DOWNGRADED"
+        ]
         print(
-            f"[taint] Source-to-sink findings: {len(taint_summary.findings)}; "
+            f"[taint] Active findings: {len(active_taint_findings)}; "
             f"judge downgrades: {len(taint_summary.audit)}; "
             f"analysis complete: {taint_summary.complete}."
         )
@@ -136,7 +143,7 @@ def scan_target(
             platform,
             findings,
             report_root,
-            v5_taint_findings=taint_summary.findings,
+            v5_taint_findings=active_taint_findings,
             v5_audit=taint_summary.audit,
         )
     print(f"[report] Saved current-run JSON to {json_path}")
@@ -156,7 +163,16 @@ def scan_target(
 
     return ScanResult(
         findings,
-        1 if findings or (taint_summary and taint_summary.findings) else 0,
+        1
+        if findings
+        or (
+            taint_summary
+            and any(
+                finding.get("status") != "DOWNGRADED"
+                for finding in taint_summary.findings
+            )
+        )
+        else 0,
     )
 
 
@@ -180,7 +196,52 @@ def main(argv: list[str] | None = None) -> int:
         default="regex",
         help="regex preserves V4 behavior; taint adds opt-in parser/data-flow results",
     )
+    parser.add_argument(
+        "source_file",
+        nargs="?",
+        help="scan one PHP file directly (requires --engine=taint)",
+    )
     args = parser.parse_args(argv)
+
+    if args.source_file is not None:
+        if args.engine != "taint":
+            print("[error] A direct PHP file requires --engine=taint.")
+            return 2
+        try:
+            regex_summary, taint_summary = scan_php_file_with_taint(args.source_file)
+        except (OSError, ValueError) as error:
+            print(f"[error] Could not scan PHP source: {error}")
+            return 2
+        records = [
+            {
+                "file": finding["file"],
+                "line": finding["line"],
+                "type": finding["type"],
+                "confidence": finding.get("confidence", "LOW"),
+                "auth_present": bool(finding.get("auth_present")),
+                "manual_verification_required": True,
+                "platform": "wordpress",
+                "status": finding.get("status", "POTENTIAL"),
+                "evidence": finding.get("evidence", ""),
+            }
+            for finding in regex_summary.findings
+        ]
+        active_taint_findings = [
+            finding
+            for finding in taint_summary.findings
+            if finding.get("status") != "DOWNGRADED"
+        ]
+        print(
+            json.dumps(
+                {
+                    "findings": records,
+                    "v5_taint_findings": active_taint_findings,
+                    "v5_audit": taint_summary.audit,
+                },
+                indent=2,
+            )
+        )
+        return 1 if records or active_taint_findings else 0
 
     print("Hunter OS v4: offline project identification and WordPress source review")
     print("No remote downloads, vulnerability-site requests, or exploit requests are made.")

@@ -121,8 +121,6 @@ _UNSUPPORTED_STATEMENTS = {
     "const",
     "global",
     "static",
-    "echo",
-    "print",
     "include",
     "include_once",
     "require",
@@ -141,8 +139,6 @@ _UNSUPPORTED_STATEMENTS = {
     "readonly",
 }
 _UNSUPPORTED_EXPRESSION_KEYWORDS = {
-    "echo",
-    "print",
     "fn",
     "match",
     "yield",
@@ -209,6 +205,13 @@ class CallStatement:
 
 
 @dataclass(frozen=True)
+class OutputStatement:
+    kind: str
+    expressions: tuple[Expression, ...]
+    location: SourceLocation
+
+
+@dataclass(frozen=True)
 class ReturnStatement:
     value: Expression | None
     location: SourceLocation
@@ -222,7 +225,7 @@ class IfStatement:
     location: SourceLocation
 
 
-Statement = Assignment | CallStatement | ReturnStatement | IfStatement
+Statement = Assignment | CallStatement | OutputStatement | ReturnStatement | IfStatement
 
 
 @dataclass(frozen=True)
@@ -742,6 +745,8 @@ class _Parser:
             return self._parse_if()
         if keyword == "return":
             return self._parse_return()
+        if keyword in {"echo", "print"}:
+            return self._parse_output()
         if keyword in _UNSUPPORTED_CONTROLS:
             self._diagnose(
                 f"{token.value} control-flow syntax is outside the parsed subset",
@@ -819,6 +824,24 @@ class _Parser:
             else None
         )
         return ReturnStatement(value, self.location(start.start))
+
+    def _parse_output(self) -> OutputStatement:
+        start = self._take()
+        assert start is not None
+        expression_tokens = self._read_until_semicolon()
+        segments = (
+            self._split_top_level(expression_tokens, ",")
+            if start.value.lower() == "echo"
+            else [expression_tokens]
+        )
+        expressions = tuple(
+            self._parse_expression(segment, segment[0].start)
+            for segment in segments
+            if segment
+        )
+        if not expressions:
+            self._diagnose(f"{start.value} requires an expression", start, "parser_error")
+        return OutputStatement(start.value.lower(), expressions, self.location(start.start))
 
     def _parse_expression_statement(self) -> Statement | None:
         start = self._peek()

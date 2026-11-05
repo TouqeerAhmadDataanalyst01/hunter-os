@@ -3,6 +3,8 @@ from __future__ import annotations
 import io
 import json
 import shutil
+import subprocess
+import sys
 import tempfile
 import unittest
 from datetime import datetime, timezone
@@ -96,6 +98,317 @@ class ExistingWordPressFilterTests(unittest.TestCase):
 
 
 class TaintScannerModeTests(unittest.TestCase):
+    def test_real_file_cli_reports_only_unsanitized_xss(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            source = root / "vuln.php"
+            source.write_text(
+                "<?php\n"
+                "function show(){ $id = $_GET['id']; echo $id; }\n"
+                "function safe(){ $id = sanitize_text_field($_GET['id']); "
+                "echo esc_html($id); }\n",
+                encoding="utf-8",
+            )
+
+            completed = subprocess.run(
+                [
+                    sys.executable,
+                    str(Path(__file__).resolve().parents[1] / "main.py"),
+                    "--engine=taint",
+                    str(source),
+                ],
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+
+            self.assertEqual(completed.returncode, 1, completed.stderr)
+            report = json.loads(completed.stdout)
+            self.assertEqual(report["findings"], [])
+            self.assertEqual(len(report["v5_taint_findings"]), 1)
+            finding = report["v5_taint_findings"][0]
+            self.assertEqual(finding["type"], "Cross-Site Scripting (XSS)")
+            self.assertEqual(finding["function"], "show")
+            self.assertEqual(finding["source"]["name"], "$_GET")
+            self.assertEqual(finding["sink"]["name"], "echo")
+            trace = finding["trace"]
+            self.assertEqual(trace[0]["name"], "$_GET")
+            self.assertTrue(any(step["name"] == "$id" for step in trace))
+            self.assertTrue(any(step["name"] == "echo" for step in trace))
+            self.assertEqual(len(report["v5_audit"]), 1)
+            self.assertEqual(report["v5_audit"][0]["finding"]["function"], "safe")
+            self.assertEqual(
+                report["v5_audit"][0]["finding"]["status"], "DOWNGRADED"
+            )
+
+    def test_real_file_sqli_source_reaches_database_query(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            (root / "query.php").write_text(
+                "<?php function search(){ "
+                "$id = $_GET['id']; $wpdb->query('SELECT * FROM t WHERE id=' . $id); }",
+                encoding="utf-8",
+            )
+
+            result = scan_plugin_with_taint(root)
+
+            self.assertIn("SQL Injection", {item["type"] for item in result.findings})
+            finding = next(
+                item for item in result.findings if item["type"] == "SQL Injection"
+            )
+            self.assertEqual(finding["source"]["name"], "$_GET")
+            self.assertEqual(finding["sink"]["name"], "$wpdb->query")
+
+    def test_real_file_print_is_an_xss_output_sink(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            (root / "print.php").write_text(
+                "<?php function output(){ print $_REQUEST['value']; }",
+                encoding="utf-8",
+            )
+
+            result = scan_plugin_with_taint(root)
+
+            xss = [
+                item for item in result.findings
+                if item["type"] == "Cross-Site Scripting (XSS)"
+            ]
+            self.assertEqual(len(xss), 1)
+            self.assertEqual(xss[0]["sink"]["name"], "print")
+
+    def test_real_file_prepared_sqli_is_audited_not_reported_as_active(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            (root / "prepared.php").write_text(
+                "<?php function search(){ $id = $_GET['id']; "
+                "$wpdb->query($wpdb->prepare('SELECT * FROM t WHERE id=%s', $id)); }",
+                encoding="utf-8",
+            )
+
+            result = scan_plugin_with_taint(root)
+
+            prepared = [
+                item for item in result.findings if item["type"] == "SQL Injection"
+            ]
+            self.assertEqual(len(prepared), 1)
+            self.assertEqual(prepared[0]["status"], "DOWNGRADED")
+            self.assertTrue(prepared[0]["sanitizer_evidence"])
+            self.assertEqual(result.audit[0]["reason"], "effective sanitizer")
+
+    def test_real_file_ajax_nopriv_sensitive_action_requires_authorization(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            (root / "ajax.php").write_text(
+                "<?php\n"
+                "add_action('wp_ajax_nopriv_update', 'handle_update');\n"
+                "function handle_update(){ update_option('site_name', $_POST['name']); }\n",
+                encoding="utf-8",
+            )
+
+            result = scan_plugin_with_taint(root)
+
+            ajax_findings = [
+                item for item in result.findings if "AJAX" in item["type"]
+            ]
+            self.assertEqual(len(ajax_findings), 1)
+            self.assertEqual(ajax_findings[0]["type"], "Unauthenticated WordPress AJAX Action")
+            self.assertEqual(ajax_findings[0]["sink"]["name"], "update_option")
+
+    def test_real_file_ajax_nonce_is_not_authorization_but_guard_is_audited(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            (root / "nonce_only.php").write_text(
+                "<?php\n"
+                "add_action('wp_ajax_nopriv_nonce', 'nonce_handler');\n"
+                "function nonce_handler(){ "
+                "check_ajax_referer('nonce'); update_option('name', 'value'); }\n",
+                encoding="utf-8",
+            )
+            (root / "guarded.php").write_text(
+                "<?php\n"
+                "add_action('wp_ajax_nopriv_guarded', 'guarded_handler');\n"
+                "function guarded_handler(){ "
+                "if (!current_user_can('manage_options')) { return; } "
+                "update_option('name', 'value'); }\n",
+                encoding="utf-8",
+            )
+
+            result = scan_plugin_with_taint(root)
+
+            ajax_findings = [
+                item for item in result.findings
+                if item["type"] == "Unauthenticated WordPress AJAX Action"
+            ]
+            nonce_only = next(
+                item for item in ajax_findings if item["function"] == "nonce_handler"
+            )
+            guarded = next(
+                item for item in ajax_findings if item["function"] == "guarded_handler"
+            )
+            self.assertTrue(nonce_only["nonce_evidence"])
+            self.assertFalse(nonce_only["auth_evidence"])
+            self.assertEqual(nonce_only["status"], "POTENTIAL")
+            self.assertTrue(guarded["auth_evidence"])
+            self.assertEqual(guarded["status"], "DOWNGRADED")
+            self.assertTrue(any(
+                item["finding"]["function"] == "guarded_handler"
+                for item in result.audit
+            ))
+
+    def test_real_file_upload_flags_file_reaching_upload_api_not_reference_alone(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            (root / "upload.php").write_text(
+                "<?php function receive(){ "
+                "move_uploaded_file($_FILES['upload']['tmp_name'], '/tmp/file'); }\n",
+                encoding="utf-8",
+            )
+            (root / "reference_only.php").write_text(
+                "<?php function inspect(){ $file = $_FILES['upload']; }\n",
+                encoding="utf-8",
+            )
+
+            result = scan_plugin_with_taint(root)
+
+            uploads = [
+                item for item in result.findings if item["type"] == "Unsafe File Upload"
+            ]
+            self.assertEqual(len(uploads), 1)
+            self.assertEqual(uploads[0]["file"], "upload.php")
+            self.assertEqual(uploads[0]["sink"]["name"], "move_uploaded_file")
+
+    def test_real_file_upload_nonce_is_not_auth_but_capability_guard_is_audited(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            (root / "nonce.php").write_text(
+                "<?php function receive(){ check_admin_referer('upload'); "
+                "move_uploaded_file($_FILES['upload']['tmp_name'], '/tmp/file'); }",
+                encoding="utf-8",
+            )
+            (root / "guarded.php").write_text(
+                "<?php function receive(){ "
+                "if (!current_user_can('upload_files')) { return; } "
+                "move_uploaded_file($_FILES['upload']['tmp_name'], '/tmp/file'); }",
+                encoding="utf-8",
+            )
+
+            result = scan_plugin_with_taint(root)
+
+            nonce = next(
+                item for item in result.findings
+                if item["file"] == "nonce.php" and item["type"] == "Unsafe File Upload"
+            )
+            guarded = next(
+                item for item in result.findings
+                if item["file"] == "guarded.php" and item["type"] == "Unsafe File Upload"
+            )
+            self.assertFalse(nonce["auth_evidence"])
+            self.assertEqual(nonce["status"], "POTENTIAL")
+            self.assertTrue(guarded["auth_evidence"])
+            self.assertEqual(guarded["status"], "DOWNGRADED")
+
+    def test_real_file_traversal_user_path_reaches_file_read(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            (root / "read.php").write_text(
+                "<?php function read_file(){ "
+                "$path = $_GET['path']; file_get_contents($path); }\n",
+                encoding="utf-8",
+            )
+
+            result = scan_plugin_with_taint(root)
+
+            traversal = [
+                item for item in result.findings
+                if item["type"] == "Directory Traversal / Local File Inclusion"
+            ]
+            self.assertEqual(len(traversal), 1)
+            self.assertEqual(traversal[0]["source"]["name"], "$_GET")
+            self.assertEqual(traversal[0]["sink"]["name"], "file_get_contents")
+
+    def test_real_file_traversal_requires_path_to_reach_file_operation(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            (root / "unrelated.php").write_text(
+                "<?php function handler(){ $_GET['path']; file_get_contents('/safe/file'); }",
+                encoding="utf-8",
+            )
+
+            result = scan_plugin_with_taint(root)
+
+            self.assertNotIn(
+                "Directory Traversal / Local File Inclusion",
+                {item["type"] for item in result.findings},
+            )
+
+    def test_real_file_command_injection_source_reaches_shell(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            (root / "command.php").write_text(
+                "<?php function run_command(){ system($_GET['command']); }",
+                encoding="utf-8",
+            )
+
+            result = scan_plugin_with_taint(root)
+
+            command_findings = [
+                item for item in result.findings
+                if item["type"] == "Command Injection"
+            ]
+            self.assertEqual(len(command_findings), 1)
+            self.assertEqual(command_findings[0]["sink"]["name"], "system")
+
+    def test_real_file_ssrf_source_reaches_outbound_request(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            (root / "request.php").write_text(
+                "<?php function fetch_remote(){ wp_remote_get($_GET['url']); }",
+                encoding="utf-8",
+            )
+
+            result = scan_plugin_with_taint(root)
+
+            ssrf_findings = [
+                item for item in result.findings
+                if item["type"] == "Server-Side Request Forgery"
+            ]
+            self.assertEqual(len(ssrf_findings), 1)
+            self.assertEqual(ssrf_findings[0]["sink"]["name"], "wp_remote_get")
+
+    def test_real_file_secret_detector_reports_high_confidence_key_only(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            (root / "credentials.php").write_text(
+                "<?php\n"
+                "$api_key = 'AKIA7N4M9Q2R8X5V3C1B';\n"
+                "$password = 'your-password-here';\n",
+                encoding="utf-8",
+            )
+
+            result = scan_plugin_with_taint(root)
+
+            secrets = [item for item in result.findings if "Secret" in item["type"]]
+            self.assertEqual(len(secrets), 1)
+            self.assertEqual(secrets[0]["type"], "Hardcoded Secret")
+            self.assertEqual(secrets[0]["line"], 2)
+            self.assertEqual(secrets[0]["confidence"], "high")
+
+    def test_real_file_secret_detector_ignores_comment_examples(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            (root / "examples.php").write_text(
+                "<?php\n"
+                "// $api_key = 'AKIA7N4M9Q2R8X5V3C1B';\n"
+                "$api_key = 'your-api-key-goes-here';\n",
+                encoding="utf-8",
+            )
+
+            result = scan_plugin_with_taint(root)
+
+            self.assertNotIn(
+                "Hardcoded Secret", {item["type"] for item in result.findings}
+            )
+
     def test_regex_mode_matches_default_v4_output_and_report_bytes(self) -> None:
         class FixedDateTime(datetime):
             @classmethod

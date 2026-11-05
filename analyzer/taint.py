@@ -12,6 +12,7 @@ from analyzer.php_parser import (
     Expression,
     FunctionDef,
     IfStatement,
+    OutputStatement,
     Program,
     ReturnStatement,
     SourceLocation,
@@ -114,6 +115,11 @@ DEFAULT_SINKS = (
     TaintSink("$wpdb->get_results", "sql"),
     TaintSink("$wpdb->get_row", "sql"),
     TaintSink("$wpdb->get_var", "sql"),
+    *(TaintSink(name, "upload", (0,)) for name in (
+        "move_uploaded_file",
+        "wp_handle_upload",
+        "wp_handle_sideload",
+    )),
     *(TaintSink(name, "command") for name in (
         "exec",
         "shell_exec",
@@ -564,38 +570,52 @@ class _Analyzer:
             for argument_index in sink_spec.argument_indices:
                 if argument_index < 0 or argument_index >= len(arguments):
                     continue
-                sink_step = self._step("sink", sink_spec.name, call.location)
-                for value in arguments[argument_index]:
-                    flow = TaintFlow(
-                        value.source,
-                        sink_step,
-                        sink_spec.context,
-                        value.trace + (sink_step,),
-                        value.sanitizers,
-                        sink_spec.context in value.sanitized_contexts,
-                    )
-                    key = (
-                        flow.source.name,
-                        flow.source.location.file,
-                        flow.source.location.offset,
-                        flow.sink.name,
-                        flow.sink.location.file,
-                        flow.sink.location.offset,
-                        flow.context,
-                        tuple((item.name, item.location.offset) for item in flow.sanitizers),
-                        flow.mitigated,
-                    )
-                    if key in self._flow_keys:
-                        continue
-                    if len(self.result.flows) >= self.limits.max_flows:
-                        self._diagnose(
-                            f"Taint analysis exceeded {self.limits.max_flows} findings",
-                            "flow_limit",
-                            call.location,
-                        )
-                        return
-                    self._flow_keys.add(key)
-                    self.result.flows.append(flow)
+                self._record_sink_values(
+                    sink_spec.name,
+                    sink_spec.context,
+                    call.location,
+                    arguments[argument_index],
+                )
+
+    def _record_sink_values(
+        self,
+        sink_name: str,
+        context: str,
+        location: SourceLocation,
+        values: set[_TaintedValue],
+    ) -> None:
+        sink_step = self._step("sink", sink_name, location)
+        for value in values:
+            flow = TaintFlow(
+                value.source,
+                sink_step,
+                context,
+                value.trace + (sink_step,),
+                value.sanitizers,
+                context in value.sanitized_contexts,
+            )
+            key = (
+                flow.source.name,
+                flow.source.location.file,
+                flow.source.location.offset,
+                flow.sink.name,
+                flow.sink.location.file,
+                flow.sink.location.offset,
+                flow.context,
+                tuple((item.name, item.location.offset) for item in flow.sanitizers),
+                flow.mitigated,
+            )
+            if key in self._flow_keys:
+                continue
+            if len(self.result.flows) >= self.limits.max_flows:
+                self._diagnose(
+                    f"Taint analysis exceeded {self.limits.max_flows} findings",
+                    "flow_limit",
+                    location,
+                )
+                return
+            self._flow_keys.add(key)
+            self.result.flows.append(flow)
 
     def _merge_environments(
         self, environments: list[dict[str, set[_TaintedValue]]]
@@ -651,6 +671,15 @@ class _Analyzer:
                 )
             elif isinstance(statement, CallStatement):
                 self._evaluate_expression(statement.expression, current, depth)
+            elif isinstance(statement, OutputStatement):
+                for expression in statement.expressions:
+                    values = self._evaluate_expression(expression, current, depth)
+                    self._record_sink_values(
+                        statement.kind,
+                        "html",
+                        statement.location,
+                        values,
+                    )
             elif isinstance(statement, ReturnStatement):
                 if statement.value is not None:
                     returns = self._bounded_values(

@@ -11,7 +11,12 @@ from pathlib import Path
 from unittest.mock import patch
 
 from analyzer.wordpress import MAX_SOURCE_BYTES, scan_plugin, scan_plugin_with_summary
-from analyzer.php_parser import MAX_NESTED_CALLS, parse_php, parse_php_file
+from analyzer.php_parser import (
+    MAX_NESTED_CALLS,
+    OutputStatement,
+    parse_php,
+    parse_php_file,
+)
 from analyzer.taint import (
     DEFAULT_SANITIZERS,
     DEFAULT_SOURCES,
@@ -313,6 +318,28 @@ class ScannerTests(unittest.TestCase):
 
 class PhpParserTests(unittest.TestCase):
     FIXTURES = Path(__file__).parent / "fixtures" / "php"
+
+    def test_echo_and_print_output_statements_preserve_locations(self) -> None:
+        program = parse_php(
+            "<?php function output(){ echo $_GET['x'], esc_html($x); print($x); }",
+            "output.php",
+        )
+
+        self.assertTrue(program.complete, program.diagnostics)
+        statements = program.functions[0].body
+        self.assertTrue(all(isinstance(item, OutputStatement) for item in statements))
+        echo, print_statement = statements
+        self.assertEqual(echo.kind, "echo")
+        self.assertEqual(len(echo.expressions), 2)
+        self.assertEqual(echo.location.line, 1)
+        self.assertEqual(print_statement.kind, "print")
+        self.assertEqual(len(print_statement.expressions), 1)
+
+    def test_malformed_output_statement_is_not_complete(self) -> None:
+        program = parse_php("<?php function output(){ echo $_GET['x'] }")
+
+        self.assertFalse(program.complete)
+        self.assertTrue(program.diagnostics)
 
     def test_supported_subset_tracks_functions_methods_assignments_calls_and_branches(self) -> None:
         program = parse_php_file(self.FIXTURES / "supported.php")

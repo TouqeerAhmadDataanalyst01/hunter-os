@@ -14,12 +14,14 @@ from analyzer.php_parser import (
     Expression,
     FunctionDef,
     IfStatement,
+    OutputStatement,
     Program,
     ReturnStatement,
     SourceLocation,
     Statement,
     parse_php_file,
 )
+from analyzer.detectors import detect_hardcoded_secrets
 from analyzer.taint import (
     DEFAULT_SANITIZERS,
     TaintAnalysisResult,
@@ -236,6 +238,8 @@ def _statement_expressions(
             expressions.append(statement.value)
         elif isinstance(statement, CallStatement):
             expressions.append(statement.expression)
+        elif isinstance(statement, OutputStatement):
+            expressions.extend(statement.expressions)
         elif isinstance(statement, ReturnStatement) and statement.value is not None:
             expressions.append(statement.value)
         elif isinstance(statement, IfStatement):
@@ -402,6 +406,7 @@ def _finding_from_flow(
     flow: TaintFlow,
     auth_evidence: list[dict[str, object]],
     relative_file: str,
+    program: Program,
 ) -> dict[str, object]:
     source = {
         "name": flow.source.name,
@@ -452,13 +457,24 @@ def _finding_from_flow(
         }
         for step in flow.sanitizers
     ]
+    categories = {
+        "html": "Cross-Site Scripting (XSS)",
+        "sql": "SQL Injection",
+        "upload": "Unsafe File Upload",
+        "file_path": "Directory Traversal / Local File Inclusion",
+        "command": "Command Injection",
+        "network_url": "Server-Side Request Forgery",
+    }
     finding: dict[str, object] = {
         "file": relative_file,
         "line": flow.sink.location.line,
-        "type": f"Tainted data reaches {flow.context} sink {flow.sink.name}",
+        "type": categories.get(
+            flow.context, f"Tainted data reaches {flow.context} sink {flow.sink.name}"
+        ),
         "status": "POTENTIAL",
         "confidence": "medium",
         "context": flow.context,
+        "function": _function_name_for_location(program, flow.sink.location),
         "source": source,
         "sink": sink,
         "trace": trace,
@@ -467,6 +483,196 @@ def _finding_from_flow(
         "note": "Source-to-sink evidence requires manual review; authorization is not inferred from nearby tokens.",
     }
     return finding
+
+
+def _function_name_for_location(
+    program: Program, location: SourceLocation
+) -> str | None:
+    functions = list(program.functions)
+    for class_def in program.classes:
+        functions.extend(class_def.methods)
+    for function in functions:
+        body = tuple(function.body)
+        if _contains_call_at(body, location) or any(
+            isinstance(statement, OutputStatement)
+            and statement.location.file == location.file
+            and statement.location.offset == location.offset
+            for statement in _walk_statements(body)
+        ):
+            return (
+                f"{function.class_name}::{function.name}"
+                if function.class_name
+                else function.name
+            )
+    return None
+
+
+def _walk_statements(
+    statements: tuple[Statement, ...] | list[Statement],
+) -> list[Statement]:
+    result: list[Statement] = []
+    for statement in statements:
+        result.append(statement)
+        if isinstance(statement, IfStatement):
+            result.extend(_walk_statements(statement.then_body))
+            result.extend(_walk_statements(statement.else_body))
+    return result
+
+
+_AJAX_SENSITIVE_CALLS = {
+    "update_option",
+    "add_option",
+    "delete_option",
+    "update_user_meta",
+    "delete_user_meta",
+    "update_post_meta",
+    "delete_post_meta",
+    "wp_insert_user",
+    "wp_delete_user",
+    "wp_update_post",
+    "wp_delete_post",
+    "move_uploaded_file",
+    "wp_handle_upload",
+    "wp_handle_sideload",
+    "unlink",
+    "file_put_contents",
+    "exec",
+    "shell_exec",
+    "system",
+    "passthru",
+}
+
+
+def _literal_string(value: str) -> str | None:
+    value = value.strip()
+    if len(value) < 2 or value[0] not in {"'", '"'} or value[-1] != value[0]:
+        return None
+    return value[1:-1]
+
+
+def _program_functions(program: Program) -> list[FunctionDef]:
+    functions = list(program.functions)
+    for class_def in program.classes:
+        functions.extend(class_def.methods)
+    return functions
+
+
+def _ajax_findings(program: Program, relative_file: str) -> list[dict[str, object]]:
+    all_statements: list[tuple[str, tuple[Statement, ...]]] = [
+        ("<top-level>", tuple(program.statements))
+    ]
+    all_statements.extend(
+        (function.name, tuple(function.body))
+        for function in _program_functions(program)
+    )
+    calls = [
+        call
+        for _, statements in all_statements
+        for call in _scope_calls(statements)
+    ]
+    functions_by_name: dict[str, list[FunctionDef]] = {}
+    for function in _program_functions(program):
+        functions_by_name.setdefault(function.name.casefold(), []).append(function)
+
+    findings: list[dict[str, object]] = []
+    for registration in calls:
+        if registration.name.casefold() not in {"add_action", "add_filter"}:
+            continue
+        if len(registration.arguments) < 2:
+            continue
+        hook = _literal_string(registration.arguments[0])
+        callback = _literal_string(registration.arguments[1])
+        if hook is None or callback is None or not hook.casefold().startswith("wp_ajax_nopriv_"):
+            continue
+        targets = functions_by_name.get(callback.casefold(), [])
+        if len(targets) != 1:
+            continue
+        function = targets[0]
+        sensitive_call = next(
+            (
+                call
+                for call in _scope_calls(tuple(function.body))
+                if call.name.rsplit("->", 1)[-1].rsplit("::", 1)[-1].casefold()
+                in _AJAX_SENSITIVE_CALLS
+                or call.name.casefold()
+                in {"$wpdb->query", "$wpdb->get_results", "$wpdb->get_row", "$wpdb->get_var"}
+            ),
+            None,
+        )
+        if sensitive_call is None:
+            continue
+        scope_name = (
+            f"{function.class_name}::{function.name}"
+            if function.class_name
+            else function.name
+        )
+        auth_evidence = _guard_evidence_in_scope(
+            tuple(function.body),
+            sensitive_call.location,
+            scope_name,
+            relative_file,
+        )
+        nonce_evidence = [
+            {
+                "name": call.name,
+                "file": relative_file,
+                "line": call.location.line,
+                "note": "nonce verification is not authorization proof",
+            }
+            for call in _scope_calls(tuple(function.body))
+            if call.name.rsplit("->", 1)[-1].rsplit("::", 1)[-1].casefold()
+            in {"check_ajax_referer", "wp_verify_nonce"}
+        ]
+        line = sensitive_call.location.line
+        findings.append(
+            {
+                "file": relative_file,
+                "line": line,
+                "type": "Unauthenticated WordPress AJAX Action",
+                "status": "POTENTIAL",
+                "confidence": "medium",
+                "context": "ajax_authorization",
+                "function": scope_name,
+                "source": {
+                    "name": hook,
+                    "file": relative_file,
+                    "line": registration.location.line,
+                },
+                "sink": {
+                    "name": sensitive_call.name,
+                    "file": relative_file,
+                    "line": line,
+                },
+                "trace": [
+                    {
+                        "kind": "hook",
+                        "name": hook,
+                        "file": relative_file,
+                        "line": registration.location.line,
+                    },
+                    {
+                        "kind": "callback",
+                        "name": scope_name,
+                        "file": relative_file,
+                        "line": function.location.line,
+                    },
+                    {
+                        "kind": "sensitive_operation",
+                        "name": sensitive_call.name,
+                        "file": relative_file,
+                        "line": line,
+                    },
+                ],
+                "sanitizer_evidence": [],
+                "auth_evidence": auth_evidence,
+                "nonce_evidence": nonce_evidence,
+                "note": (
+                    "Public wp_ajax_nopriv callback reaches a sensitive operation; "
+                    "nonce verification alone does not establish authorization."
+                ),
+            }
+        )
+    return findings
 
 
 def _judge_taint_findings(
@@ -483,7 +689,7 @@ def _judge_taint_findings(
         ):
             reasons.append("effective sanitizer")
         if auth_evidence:
-            reasons.append("same-function authorization call before sink")
+            reasons.append("same-function authorization guard before sink")
         if not reasons:
             continue
         original_confidence = finding["confidence"]
@@ -498,7 +704,7 @@ def _judge_taint_findings(
                 "sanitizer_evidence": sanitizer_evidence,
                 "auth_evidence": auth_evidence,
                 "finding": dict(finding),
-                "note": "Judge V2 stub downgraded but preserved the flow; this is not proof of safety.",
+                "note": "Judge V2 downgraded but preserved the evidence; this is not proof of safety.",
             }
         )
     return audit
@@ -537,31 +743,39 @@ def scan_plugin_with_taint(path: str | Path) -> TaintScanSummary:
     ]
     for source_file in candidates:
         relative_file = source_file.relative_to(root).as_posix()
-        program = parse_php_file(source_file)
-        if not program.complete:
-            result.complete = False
-            result.diagnostics.extend(
-                {
-                    "file": relative_file,
-                    "line": diagnostic.location.line,
-                    "code": diagnostic.code,
-                    "message": diagnostic.message,
-                }
-                for diagnostic in program.diagnostics
-            )
-            note = "; ".join(item.message for item in program.diagnostics)
-            result.findings.append(
-                _incomplete_finding(
-                    relative_file,
-                    program.diagnostics[0].location.line
-                    if program.diagnostics
-                    else 1,
-                    note or "PHP parser did not complete",
-                    "incomplete_parse",
-                )
-            )
-            continue
+        _analyze_taint_file(source_file, relative_file, result)
 
+    result.audit = _judge_taint_findings(result.findings)
+    return result
+
+
+def _analyze_taint_file(
+    source_file: Path, relative_file: str, result: TaintScanSummary
+) -> None:
+    program = parse_php_file(source_file)
+    if not program.complete:
+        result.complete = False
+        result.diagnostics.extend(
+            {
+                "file": relative_file,
+                "line": diagnostic.location.line,
+                "code": diagnostic.code,
+                "message": diagnostic.message,
+            }
+            for diagnostic in program.diagnostics
+        )
+        note = "; ".join(item.message for item in program.diagnostics)
+        result.findings.append(
+            _incomplete_finding(
+                relative_file,
+                program.diagnostics[0].location.line
+                if program.diagnostics
+                else 1,
+                note or "PHP parser did not complete",
+                "incomplete_parse",
+            )
+        )
+    else:
         analysis: TaintAnalysisResult = analyze_program(program)
         if not analysis.complete:
             result.complete = False
@@ -591,11 +805,57 @@ def scan_plugin_with_taint(path: str | Path) -> TaintScanSummary:
                     flow,
                     _auth_evidence_for_flow(program, flow, relative_file),
                     relative_file,
+                    program,
                 )
             )
+        result.findings.extend(_ajax_findings(program, relative_file))
 
-    result.audit = _judge_taint_findings(result.findings)
-    return result
+    try:
+        if source_file.stat().st_size <= MAX_SOURCE_BYTES:
+            source = source_file.read_text(encoding="utf-8", errors="replace")
+            result.findings.extend(detect_hardcoded_secrets(source, relative_file))
+    except OSError as error:
+        result.complete = False
+        message = f"Could not inspect source for hardcoded secrets: {error}"
+        result.diagnostics.append(
+            {
+                "file": relative_file,
+                "line": 1,
+                "code": "secret_read_error",
+                "message": message,
+            }
+        )
+        result.findings.append(
+            _incomplete_finding(relative_file, 1, message, "secret_read_error")
+        )
+
+
+def scan_php_file_with_taint(
+    path: str | Path,
+) -> tuple[ScanSummary, TaintScanSummary]:
+    """Scan one explicitly supplied PHP file without changing plugin scan scope."""
+    supplied_path = Path(path).expanduser()
+    if supplied_path.is_symlink():
+        raise ValueError(f"Refusing to scan a symbolic link: {supplied_path}")
+    source_file = supplied_path.resolve()
+    if not source_file.is_file():
+        raise FileNotFoundError(f"PHP source file not found: {source_file}")
+    if source_file.suffix.lower() != ".php":
+        raise ValueError(f"Expected a PHP source file: {source_file}")
+    root = source_file.parent
+    regex_summary = ScanSummary()
+    findings, skip_reason = _inspect_file(source_file, root)
+    if skip_reason is None:
+        regex_summary.scanned_files = 1
+        regex_summary.findings.extend(findings)
+    else:
+        regex_summary.skipped.append(
+            {"path": source_file.name, "reason": skip_reason}
+        )
+    taint_summary = TaintScanSummary()
+    _analyze_taint_file(source_file, source_file.name, taint_summary)
+    taint_summary.audit = _judge_taint_findings(taint_summary.findings)
+    return regex_summary, taint_summary
 
 
 def list_scan_files(path: str | Path) -> list[Path]:

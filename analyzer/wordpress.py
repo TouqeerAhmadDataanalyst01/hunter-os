@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import os
 import re
+import time
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -159,8 +160,12 @@ def scan_plugin(path: str | Path) -> list[dict[str, object]]:
     return scan_plugin_with_summary(path).findings
 
 
-def scan_plugin_with_summary(path: str | Path) -> ScanSummary:
+def scan_plugin_with_summary(
+    path: str | Path, *, max_files: int | None = None
+) -> ScanSummary:
     """Run the existing heuristics and return visible file dispositions."""
+    if max_files is not None and max_files < 1:
+        raise ValueError("File limit must be positive")
     root = Path(path).expanduser().resolve()
     if not root.is_dir():
         raise NotADirectoryError(f"Plugin source directory not found: {root}")
@@ -172,6 +177,7 @@ def scan_plugin_with_summary(path: str | Path) -> ScanSummary:
         walk_errors.append(error)
 
     candidates: list[Path] = []
+    file_limit_reached = False
     for current, directories, filenames in os.walk(
         root, topdown=True, followlinks=False, onerror=record_walk_error
     ):
@@ -205,10 +211,16 @@ def scan_plugin_with_summary(path: str | Path) -> ScanSummary:
                 )
             elif _is_in_scan_scope(source_file, root):
                 candidates.append(source_file)
+                if max_files is not None and len(candidates) > max_files:
+                    file_limit_reached = True
+                    directories[:] = []
+                    break
             else:
                 summary.skipped.append(
                     {"path": relative, "reason": "out of scan scope"}
                 )
+        if file_limit_reached:
+            break
 
     for error in walk_errors:
         try:
@@ -219,7 +231,14 @@ def scan_plugin_with_summary(path: str | Path) -> ScanSummary:
             {"path": relative, "reason": "unreadable directory"}
         )
 
-    for source_file in sorted(candidates):
+    candidates.sort()
+    if file_limit_reached:
+        summary.skipped.append(
+            {"path": "<remaining PHP files>", "reason": "file-count limit"}
+        )
+    if max_files is not None and len(candidates) > max_files:
+        candidates = candidates[:max_files]
+    for source_file in candidates:
         findings, skip_reason = _inspect_file(source_file, root)
         if skip_reason is not None:
             summary.skipped.append(
@@ -929,21 +948,87 @@ def _incomplete_finding(
     }
 
 
-def scan_plugin_with_taint(path: str | Path) -> TaintScanSummary:
+def scan_plugin_with_taint(
+    path: str | Path,
+    *,
+    timeout_seconds: int | None = None,
+    max_files: int | None = None,
+) -> TaintScanSummary:
     """Run V4 regex checks and opt-in parser/taint analysis side by side."""
     root = Path(path).expanduser().resolve()
     if not root.is_dir():
         raise NotADirectoryError(f"Plugin source directory not found: {root}")
 
     result = TaintScanSummary()
+    if max_files is not None and max_files < 1:
+        raise ValueError("File limit must be positive")
+    if timeout_seconds is not None and timeout_seconds < 1:
+        raise ValueError("Timeout must be positive")
     candidates = [
         source_file
-        for source_file in list_scan_files(root)
+        for source_file in list_scan_files(
+            root, max_files=max_files + 1 if max_files is not None else None
+        )
         if not source_file.is_symlink()
     ]
-    for source_file in candidates:
+    over_file_limit = max_files is not None and len(candidates) > max_files
+    if over_file_limit:
+        candidates = candidates[:max_files]
+    started = time.monotonic()
+    for index, source_file in enumerate(candidates):
+        if timeout_seconds is not None and time.monotonic() - started >= timeout_seconds:
+            result.complete = False
+            message = f"Taint scan exceeded {timeout_seconds} seconds"
+            result.diagnostics.append(
+                {
+                    "file": "<scan>",
+                    "line": 1,
+                    "code": "timeout",
+                    "message": message,
+                }
+            )
+            result.findings.append(
+                _incomplete_finding("<scan>", 1, message, "timeout")
+            )
+            break
         relative_file = source_file.relative_to(root).as_posix()
         _analyze_taint_file(source_file, relative_file, result)
+        if (
+            timeout_seconds is not None
+            and time.monotonic() - started >= timeout_seconds
+            and index + 1 < len(candidates)
+        ):
+            result.complete = False
+            message = (
+                f"Taint scan reached the {timeout_seconds}-second budget; "
+                "remaining files were not analyzed"
+            )
+            result.diagnostics.append(
+                {
+                    "file": "<scan>",
+                    "line": 1,
+                    "code": "timeout",
+                    "message": message,
+                }
+            )
+            result.findings.append(
+                _incomplete_finding("<scan>", 1, message, "timeout")
+            )
+            break
+    if over_file_limit:
+        result.complete = False
+        message = f"Taint scan exceeded the {max_files}-file analysis limit"
+        result.diagnostics.append(
+            {
+                "file": "<scan>",
+                "line": 1,
+                "code": "file_count_limit",
+                "message": message,
+            }
+        )
+        result.findings.append(
+            _incomplete_finding("<scan>", 1, message, "file_count_limit")
+        )
 
     result.audit = _judge_taint_findings(result.findings)
     return result
@@ -1076,13 +1161,47 @@ def scan_php_file_with_taint(
     return regex_summary, taint_summary
 
 
-def list_scan_files(path: str | Path) -> list[Path]:
+def list_scan_files(
+    path: str | Path, *, max_files: int | None = None
+) -> list[Path]:
     """List PHP files that match the scanner's scope without reading contents."""
     root = Path(path).expanduser().resolve()
     if not root.is_dir():
         raise NotADirectoryError(f"Plugin source directory not found: {root}")
-    return [
-        source_file
-        for source_file in sorted(root.rglob("*"))
-        if source_file.is_file() and _is_in_scan_scope(source_file, root)
-    ]
+    if max_files is None:
+        return [
+            source_file
+            for source_file in sorted(root.rglob("*"))
+            if source_file.is_file() and _is_in_scan_scope(source_file, root)
+        ]
+    if max_files < 1:
+        raise ValueError("File limit must be positive")
+
+    candidates: list[Path] = []
+    for current, directories, filenames in os.walk(root, topdown=True, followlinks=False):
+        current_path = Path(current)
+        directories[:] = sorted(
+            directory
+            for directory in directories
+            if not (current_path / directory).is_symlink()
+            and directory.lower() not in IGNORE_DIRS
+            and (
+                current_path != root
+                or directory.lower() in PRIMARY_DIRECTORIES
+            )
+        )
+        for filename in sorted(filenames):
+            source_file = current_path / filename
+            if (
+                source_file.suffix.lower() == ".php"
+                and not source_file.is_symlink()
+                and (
+                    current_path == root
+                    or current_path.relative_to(root).parts[0].lower()
+                    in PRIMARY_DIRECTORIES
+                )
+            ):
+                candidates.append(source_file)
+                if len(candidates) >= max_files:
+                    return candidates
+    return candidates

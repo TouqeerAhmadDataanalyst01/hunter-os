@@ -7,6 +7,7 @@ import subprocess
 import sys
 import tempfile
 import unittest
+import zipfile
 from datetime import datetime, timezone
 from contextlib import redirect_stdout
 from pathlib import Path
@@ -16,7 +17,7 @@ from analyzer.platform import detect_platform
 from analyzer.taint import TaintSink
 from analyzer.wordpress import scan_plugin, scan_plugin_with_taint
 from duplicate_checker import is_duplicate, record_finding
-from main import main, scan_target
+from main import main, scan_source_path, scan_target
 from reporter.json_report import write_json_report
 
 
@@ -98,6 +99,151 @@ class ExistingWordPressFilterTests(unittest.TestCase):
 
 
 class TaintScannerModeTests(unittest.TestCase):
+    def test_mass_folder_scan_adds_taint_fields_and_preserves_history_dedupe(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            source = root / "mass-plugin"
+            source.mkdir()
+            (source / "one.php").write_text(
+                "<?php function output(){ echo $_GET['x']; }",
+                encoding="utf-8",
+            )
+            (source / "includes").mkdir()
+            (source / "includes" / "two.php").write_text(
+                "<?php function run_query(){ $wpdb->query($_POST['sql']); }",
+                encoding="utf-8",
+            )
+            reports = root / "reports"
+            first = scan_source_path(source, engine="taint", reports_dir=reports)
+            report_path = reports / "mass-plugin" / "report_json.json"
+            first_report = json.loads(report_path.read_text(encoding="utf-8"))
+            history = (reports / "history.json").read_bytes()
+
+            second = scan_source_path(source, engine="taint", reports_dir=reports)
+            second_report = json.loads(report_path.read_text(encoding="utf-8"))
+
+            self.assertEqual(first.exit_code, 1)
+            self.assertEqual(second.exit_code, 1)
+            self.assertEqual(
+                {item["type"] for item in first_report["findings"]},
+                {"Unauthenticated SQL Injection"},
+            )
+            self.assertEqual(
+                {item["type"] for item in second_report["findings"]},
+                {"Unauthenticated SQL Injection"},
+            )
+            self.assertEqual(len(first_report["v5_taint_findings"]), 2)
+            self.assertEqual((reports / "history.json").read_bytes(), history)
+
+    def test_mass_zip_scan_uses_safe_extraction_and_v4_regex_shape(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            archive = root / "mass.zip"
+            with zipfile.ZipFile(archive, "w") as zipped:
+                zipped.writestr(
+                    "package/plugin.php",
+                    "<?php $file = $_FILES['upload'];",
+                )
+                zipped.writestr(
+                    "package/includes/other.php",
+                    "<?php $wpdb->query($_POST['value']);",
+                )
+            reports = root / "reports"
+            temp_root = Path(tempfile.gettempdir())
+            extraction_dirs_before = set(
+                temp_root.glob("hunter-os-mass-mass-*")
+            )
+
+            result = scan_source_path(archive, engine="regex", reports_dir=reports)
+
+            report = json.loads(
+                (reports / "mass" / "report_json.json").read_text(encoding="utf-8")
+            )
+            self.assertEqual(result.exit_code, 1)
+            self.assertIsInstance(report, list)
+            self.assertEqual(
+                {item["type"] for item in report},
+                {"Unauthenticated File Upload", "Unauthenticated SQL Injection"},
+            )
+            self.assertEqual(
+                set(temp_root.glob("hunter-os-mass-mass-*")),
+                extraction_dirs_before,
+            )
+
+    def test_taint_mass_scan_handles_malformed_empty_and_oversized_php(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            source = root / "bounded"
+            source.mkdir()
+            (source / "empty.php").write_text("", encoding="utf-8")
+            (source / "broken.php").write_text(
+                "<?php function broken(){ echo $_GET['x'];",
+                encoding="utf-8",
+            )
+            (source / "large.php").write_bytes(b"x" * 2_000_001)
+
+            result = scan_source_path(
+                source,
+                engine="taint",
+                reports_dir=root / "reports",
+            )
+
+            report = json.loads(
+                (root / "reports" / "bounded" / "report_json.json").read_text(
+                    encoding="utf-8"
+                )
+            )
+            self.assertEqual(result.exit_code, 1)
+            self.assertTrue(any(
+                finding["type"] == "Incomplete taint analysis"
+                for finding in report["v5_taint_findings"]
+            ))
+            self.assertTrue(any(
+                "incomplete parse" in finding["note"].casefold()
+                for finding in report["v5_taint_findings"]
+                if finding["type"] == "Incomplete taint analysis"
+            ))
+
+    def test_taint_mass_scan_surfaces_timeout_and_file_count_limits(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            source = root / "limited"
+            source.mkdir()
+            (source / "one.php").write_text(
+                "<?php echo $_GET['x'];",
+                encoding="utf-8",
+            )
+            (source / "two.php").write_text(
+                "<?php echo $_POST['x'];",
+                encoding="utf-8",
+            )
+
+            with patch("analyzer.wordpress.time.monotonic", side_effect=[0.0, 2.0]):
+                timed_out = scan_plugin_with_taint(source, timeout_seconds=1)
+            self.assertFalse(timed_out.complete)
+            self.assertTrue(any(
+                item["code"] == "timeout" for item in timed_out.diagnostics
+            ))
+
+            reports = root / "reports"
+            with patch("main.MAX_MASS_SCAN_FILES", 1):
+                limited = scan_source_path(
+                    source,
+                    engine="taint",
+                    reports_dir=reports,
+                )
+            report = json.loads(
+                (reports / "limited" / "report_json.json").read_text(
+                    encoding="utf-8"
+                )
+            )
+            self.assertEqual(limited.exit_code, 1)
+            self.assertTrue(any(
+                item["type"] == "Incomplete taint analysis"
+                and "file analysis limit" in item["note"]
+                for item in report["v5_taint_findings"]
+            ))
+
     def test_real_file_wordpress_entrypoints_cover_ajax_shortcode_and_rest(self) -> None:
         with tempfile.TemporaryDirectory() as temporary_directory:
             root = Path(temporary_directory)

@@ -46,20 +46,20 @@
   - **Remaining for M5 completion:** Laravel route/controller analysis, Django URL/view analysis, Node.js/Express route/controller analysis, and their source/sink/auth tests.
   - **Risks:** WordPress dynamic callbacks, closures, callback arrays, complex permission functions, and cross-file registration/handlers are not resolved. Marker detection alone is insufficient support for the other frameworks.
 
-## M6: Report V5
+## M6: Mass scanner + parallel polish
 
-- [ ] M6: Report V5: add taint trace (source -> propagations -> sink with lines), confidence, fix suggestion, keep V4 fields for backwards compat
-  - **Goal:** Add structured V5 evidence and remediation while preserving every V4 JSON field and report path.
-  - **Files to touch:** `reporter/json_report.py`, `reporter/patchstack.py`, `main.py`, report fixtures/tests, docs.
-  - **Tests to add:** Backward-compatible V4 schema tests; V5 trace, confidence, remediation, sanitizer and authorization evidence serialization; safe Markdown/JSON escaping tests.
-  - **Done criteria:** Reports distinguish observed evidence from inference, expose source-to-sink locations, include a fix suggestion, and preserve legacy fields.
-  - **Risks:** Schema drift, escaped/untrusted source snippets, unsupported claims of severity, or unexpected report-history changes.
+- [x] M6: Mass scanner + parallel polish - scan folder/ZIP, preserve V4 history dedupe and regex output, add taint-mode V5 fields, and bound analysis.
+  - **Goal:** Scan local WordPress source directories and ZIPs without changing V4 regex behavior; run taint analysis alongside existing checks in opt-in mode.
+  - **Files touched:** `main.py`, `analyzer/wordpress.py`, `tests/test_v4_multi.py`, `TODO.md`, `BOOK.md`.
+  - **Tests added:** Folder taint report and duplicate-history preservation; ZIP regex report shape and temporary extraction cleanup; malformed, empty, oversized PHP; timeout and file-count limit visibility.
+  - **Done criteria:** Folder/ZIP scans create reports, regex retains the V4 JSON-list shape and dedupe, taint adds only V5 JSON fields, scan bounds are visible, malformed input does not crash.
+  - **Risks:** The timeout is cooperative between bounded file analyses, not a way to terminate Python work mid-file. The mass path is capped at 10,000 PHP files; it is not a benchmarked overnight-scale scanner.
 
-## M7: Full regression + docs update
+## M7: Reporting + docs
 
-- [ ] M7: Full regression + docs update in BOOK.md + README.md
-  - **Goal:** Validate the implemented V5 scope end to end and make supported/unsupported behavior clear to users.
-  - **Files to touch:** `tests/`, `BOOK.md`, `README.md`, and only implementation files required by discovered regressions.
-  - **Tests to add:** Clean and synthetic fixtures, end-to-end compatibility checks, malformed source, bounded analysis, and any missing per-category/framework regressions.
-  - **Done criteria:** Full unit suite, compile check, and diff checks pass; docs match actual implementation; no unsupported stage is claimed as implemented.
-  - **Risks:** Broad regression surface, stale reports/history assumptions, and overclaiming capabilities not covered by tests.
+- [ ] M7: Reporting + docs - render taint traces, confidence, sanitizer/auth evidence, and audit results in Markdown; update BOOK.md and README.md.
+  - **Goal:** Make V5 evidence and remediation visible while preserving V4 report content when V5 data is absent.
+  - **Files to touch:** `reporter/patchstack.py`, report tests, `BOOK.md`, `README.md`.
+  - **Tests to add:** V4 Markdown byte-compatibility; V5 trace, confidence, remediation, sanitizer/auth evidence, and `v5_audit` sections; safe Markdown escaping.
+  - **Done criteria:** V5 Markdown shows source-to-sink evidence and judge downgrades; docs describe current flags, folder/ZIP input, actual WordPress-only scope, parser and time/file limits.
+  - **Risks:** Schema/report drift, unsafe rendering of source-controlled text, or claiming unsupported framework and PHP syntax coverage.

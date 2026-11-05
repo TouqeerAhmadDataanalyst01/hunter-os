@@ -3,8 +3,12 @@
 from __future__ import annotations
 
 import argparse
+from concurrent.futures import ThreadPoolExecutor, TimeoutError as FutureTimeoutError
 import json
 import re
+import shutil
+import tempfile
+import time
 import zipfile
 from dataclasses import dataclass
 from pathlib import Path
@@ -16,11 +20,13 @@ from analyzer.wordpress import (
     scan_plugin_with_summary,
     scan_plugin_with_taint,
     scan_php_file_with_taint,
+    TaintScanSummary,
+    _incomplete_finding,
 )
 from duplicate_checker import is_duplicate, record_finding
 from reporter.json_report import write_json_report
 from reporter.patchstack import make_report
-from tools.download import get_plugin_local_or_instructions
+from tools.download import _extract_archive, get_plugin_local_or_instructions
 
 
 ROOT = Path(__file__).resolve().parent
@@ -28,6 +34,8 @@ TARGETS_FILE = ROOT / "targets" / "wordpress.txt"
 LOCAL_PLUGINS = ROOT / "targets" / "plugins"
 REPORTS_DIR = ROOT / "reports"
 SLUG_PATTERN = re.compile(r"[a-z0-9][a-z0-9_-]*")
+MAX_MASS_SCAN_FILES = 10_000
+DEFAULT_SCAN_TIMEOUT_SECONDS = 120
 
 
 @dataclass
@@ -55,10 +63,14 @@ def scan_target(
     dry_run: bool = False,
     reports_dir: Path | None = None,
     engine: str = "regex",
+    timeout_seconds: int = DEFAULT_SCAN_TIMEOUT_SECONDS,
 ) -> ScanResult:
     """Scan a local plugin directory or a ZIP already stored in the workspace."""
     if engine not in {"regex", "taint"}:
         print(f"[error] Unsupported analysis engine: {engine}")
+        return ScanResult([], 2)
+    if timeout_seconds < 1:
+        print("[error] Scan timeout must be a positive number of seconds.")
         return ScanResult([], 2)
     report_root = reports_dir if reports_dir is not None else REPORTS_DIR
     if not SLUG_PATTERN.fullmatch(slug):
@@ -107,9 +119,46 @@ def scan_target(
         return ScanResult([], 0)
 
     print(f"[scan] Checking local source: {plugin_path}")
-    summary = scan_plugin_with_summary(plugin_path)
+    if engine == "taint":
+        started = time.monotonic()
+        executor = ThreadPoolExecutor(max_workers=1)
+        taint_future = executor.submit(
+            scan_plugin_with_taint,
+            plugin_path,
+            timeout_seconds=timeout_seconds,
+            max_files=MAX_MASS_SCAN_FILES,
+        )
+        summary = scan_plugin_with_summary(plugin_path)
+        remaining = max(0.0, timeout_seconds - (time.monotonic() - started))
+        try:
+            taint_summary = taint_future.result(timeout=remaining)
+        except FutureTimeoutError:
+            taint_future.cancel()
+            taint_summary = TaintScanSummary(
+                findings=[
+                    _incomplete_finding(
+                        "<scan>",
+                        1,
+                        f"taint scan exceeded {timeout_seconds} seconds",
+                        "timeout",
+                    )
+                ],
+                complete=False,
+                diagnostics=[
+                    {
+                        "file": "<scan>",
+                        "line": 1,
+                        "code": "timeout",
+                        "message": f"Taint scan exceeded {timeout_seconds} seconds",
+                    }
+                ],
+            )
+        finally:
+            executor.shutdown(wait=True, cancel_futures=True)
+    else:
+        summary = scan_plugin_with_summary(plugin_path)
+        taint_summary = None
     findings = summary.findings
-    taint_summary = scan_plugin_with_taint(plugin_path) if engine == "taint" else None
     print(f"[scan] Source files checked by the existing heuristics: {summary.scanned_files}")
     skipped_by_reason: dict[str, list[str]] = {}
     for skipped in summary.skipped:
@@ -176,6 +225,151 @@ def scan_target(
     )
 
 
+def _scan_slug(path: Path) -> str:
+    raw_name = path.stem if path.is_file() else path.name
+    slug = re.sub(r"[^a-z0-9_-]+", "-", raw_name.casefold()).strip("-_")
+    if not slug or not slug[0].isalnum():
+        slug = f"scan-{slug}"
+    return slug[:64]
+
+
+def scan_source_path(
+    path: str | Path,
+    *,
+    engine: str = "regex",
+    reports_dir: Path | None = None,
+    timeout_seconds: int = DEFAULT_SCAN_TIMEOUT_SECONDS,
+) -> ScanResult:
+    """Scan a local source directory or safely extract and scan a ZIP."""
+    source_path = Path(path).expanduser()
+    if engine not in {"regex", "taint"}:
+        print(f"[error] Unsupported analysis engine: {engine}")
+        return ScanResult([], 2)
+    if timeout_seconds < 1:
+        print("[error] Scan timeout must be a positive number of seconds.")
+        return ScanResult([], 2)
+    if source_path.is_symlink():
+        print(f"[error] Refusing a symbolic-link scan target: {source_path}")
+        return ScanResult([], 2)
+    source_path = source_path.resolve()
+    report_root = reports_dir if reports_dir is not None else REPORTS_DIR
+    slug = _scan_slug(source_path)
+    extraction_path: Path | None = None
+
+    try:
+        if source_path.is_dir():
+            scan_root = source_path
+        elif source_path.is_file() and source_path.suffix.casefold() == ".zip":
+            extraction_path = Path(
+                tempfile.mkdtemp(prefix=f"hunter-os-mass-{slug}-")
+            )
+            scan_root = _extract_archive(source_path, extraction_path)
+        else:
+            print(f"[error] Expected a source directory or ZIP archive: {source_path}")
+            return ScanResult([], 2)
+
+        platform = detect_platform(scan_root)
+        if platform != "wordpress":
+            print(
+                "[manual] No tested WordPress analysis path was selected for this "
+                "source. No vulnerability scan was performed."
+            )
+            return ScanResult([], 3)
+
+        print(f"[scan] Scanning local source: {scan_root}")
+        started = time.monotonic()
+        if engine == "taint":
+            executor = ThreadPoolExecutor(max_workers=1)
+            taint_future = executor.submit(
+                scan_plugin_with_taint,
+                scan_root,
+                timeout_seconds=timeout_seconds,
+                max_files=MAX_MASS_SCAN_FILES,
+            )
+            summary = scan_plugin_with_summary(
+                scan_root, max_files=MAX_MASS_SCAN_FILES
+            )
+            remaining = max(0.0, timeout_seconds - (time.monotonic() - started))
+            try:
+                taint_summary = taint_future.result(timeout=remaining)
+            except FutureTimeoutError:
+                taint_future.cancel()
+                taint_summary = TaintScanSummary(
+                    findings=[
+                        _incomplete_finding(
+                            "<scan>",
+                            1,
+                            f"taint scan exceeded {timeout_seconds} seconds",
+                            "timeout",
+                        )
+                    ],
+                    complete=False,
+                    diagnostics=[
+                        {
+                            "file": "<scan>",
+                            "line": 1,
+                            "code": "timeout",
+                            "message": f"Taint scan exceeded {timeout_seconds} seconds",
+                        }
+                    ],
+                )
+            finally:
+                executor.shutdown(wait=True, cancel_futures=True)
+        else:
+            summary = scan_plugin_with_summary(
+                scan_root, max_files=MAX_MASS_SCAN_FILES
+            )
+            taint_summary = None
+
+        findings = summary.findings
+        if taint_summary is None:
+            report_path = write_json_report(slug, platform, findings, report_root)
+        else:
+            active_taint = [
+                finding
+                for finding in taint_summary.findings
+                if finding.get("status") != "DOWNGRADED"
+            ]
+            report_path = write_json_report(
+                slug,
+                platform,
+                findings,
+                report_root,
+                v5_taint_findings=active_taint,
+                v5_audit=taint_summary.audit,
+            )
+
+        for finding in findings:
+            file_name = str(finding["file"])
+            line_no = int(finding["line"])
+            if is_duplicate(slug, file_name, line_no, reports_dir=report_root):
+                print(f"[duplicate] {file_name}:{line_no} was seen in the last 14 days.")
+                continue
+            report = make_report(slug, finding, reports_dir=report_root)
+            record_finding(slug, file_name, line_no, reports_dir=report_root)
+            print(f"[report] Saved local review notes to {report}")
+        print(f"[report] Saved current-run JSON to {report_path}")
+        return ScanResult(
+            findings,
+            1
+            if findings
+            or (
+                taint_summary
+                and any(
+                    finding.get("status") != "DOWNGRADED"
+                    for finding in taint_summary.findings
+                )
+            )
+            else 0,
+        )
+    except (OSError, ValueError, zipfile.BadZipFile, RuntimeError) as error:
+        print(f"[error] Could not scan source: {error}")
+        return ScanResult([], 2)
+    finally:
+        if extraction_path is not None:
+            shutil.rmtree(extraction_path, ignore_errors=False)
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="Scan local WordPress plugin source.")
     parser.add_argument("--target", help="scan only this slug from targets/wordpress.txt")
@@ -197,6 +391,12 @@ def main(argv: list[str] | None = None) -> int:
         help="regex preserves V4 behavior; taint adds opt-in parser/data-flow results",
     )
     parser.add_argument(
+        "--timeout",
+        type=int,
+        default=DEFAULT_SCAN_TIMEOUT_SECONDS,
+        help="maximum taint analysis time budget in seconds (default: 120)",
+    )
+    parser.add_argument(
         "source_file",
         nargs="?",
         help="scan one PHP file directly (requires --engine=taint)",
@@ -204,6 +404,14 @@ def main(argv: list[str] | None = None) -> int:
     args = parser.parse_args(argv)
 
     if args.source_file is not None:
+        requested_path = Path(args.source_file).expanduser()
+        if requested_path.is_dir() or requested_path.suffix.casefold() == ".zip":
+            result = scan_source_path(
+                requested_path,
+                engine=args.engine,
+                timeout_seconds=args.timeout,
+            )
+            return result.exit_code
         if args.engine != "taint":
             print("[error] A direct PHP file requires --engine=taint.")
             return 2
@@ -269,6 +477,7 @@ def main(argv: list[str] | None = None) -> int:
             platform_override=args.platform,
             dry_run=args.dry_run,
             engine=args.engine,
+            timeout_seconds=args.timeout,
         )
         exit_code = max(exit_code, result.exit_code)
 

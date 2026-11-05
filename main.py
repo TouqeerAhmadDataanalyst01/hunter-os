@@ -9,7 +9,12 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from analyzer.platform import SUPPORTED_PLATFORMS, detect_platform
-from analyzer.wordpress import list_scan_files, scan_plugin, scan_plugin_with_summary
+from analyzer.wordpress import (
+    list_scan_files,
+    scan_plugin,
+    scan_plugin_with_summary,
+    scan_plugin_with_taint,
+)
 from duplicate_checker import is_duplicate, record_finding
 from reporter.json_report import write_json_report
 from reporter.patchstack import make_report
@@ -47,8 +52,12 @@ def scan_target(
     platform_override: str = "auto",
     dry_run: bool = False,
     reports_dir: Path | None = None,
+    engine: str = "regex",
 ) -> ScanResult:
     """Scan a local plugin directory or a ZIP already stored in the workspace."""
+    if engine not in {"regex", "taint"}:
+        print(f"[error] Unsupported analysis engine: {engine}")
+        return ScanResult([], 2)
     report_root = reports_dir if reports_dir is not None else REPORTS_DIR
     if not SLUG_PATTERN.fullmatch(slug):
         print(f"[skip] Invalid plugin slug: {slug!r}")
@@ -98,6 +107,7 @@ def scan_target(
     print(f"[scan] Checking local source: {plugin_path}")
     summary = scan_plugin_with_summary(plugin_path)
     findings = summary.findings
+    taint_summary = scan_plugin_with_taint(plugin_path) if engine == "taint" else None
     print(f"[scan] Source files checked by the existing heuristics: {summary.scanned_files}")
     skipped_by_reason: dict[str, list[str]] = {}
     for skipped in summary.skipped:
@@ -113,7 +123,22 @@ def scan_target(
         f"[scan] Potential findings: {len(findings)}; "
         f"nearby auth signals to review: {auth_count}."
     )
-    json_path = write_json_report(slug, platform, findings, report_root)
+    if taint_summary is None:
+        json_path = write_json_report(slug, platform, findings, report_root)
+    else:
+        print(
+            f"[taint] Source-to-sink findings: {len(taint_summary.findings)}; "
+            f"judge downgrades: {len(taint_summary.audit)}; "
+            f"analysis complete: {taint_summary.complete}."
+        )
+        json_path = write_json_report(
+            slug,
+            platform,
+            findings,
+            report_root,
+            v5_taint_findings=taint_summary.findings,
+            v5_audit=taint_summary.audit,
+        )
     print(f"[report] Saved current-run JSON to {json_path}")
 
     for finding in findings:
@@ -129,7 +154,10 @@ def scan_target(
         record_finding(slug, file_name, line_no, reports_dir=report_root)
         print(f"[report] Saved local review notes to {report_path}")
 
-    return ScanResult(findings, 1 if findings else 0)
+    return ScanResult(
+        findings,
+        1 if findings or (taint_summary and taint_summary.findings) else 0,
+    )
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -145,6 +173,12 @@ def main(argv: list[str] | None = None) -> int:
         choices=("auto", *SUPPORTED_PLATFORMS),
         default="auto",
         help="detect automatically or select a platform explicitly",
+    )
+    parser.add_argument(
+        "--engine",
+        choices=("regex", "taint"),
+        default="regex",
+        help="regex preserves V4 behavior; taint adds opt-in parser/data-flow results",
     )
     args = parser.parse_args(argv)
 
@@ -173,6 +207,7 @@ def main(argv: list[str] | None = None) -> int:
             slug,
             platform_override=args.platform,
             dry_run=args.dry_run,
+            engine=args.engine,
         )
         exit_code = max(exit_code, result.exit_code)
 

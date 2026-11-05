@@ -12,6 +12,9 @@ def write_json_report(
     platform: str,
     findings: list[dict[str, object]],
     reports_dir: Path,
+    *,
+    v5_taint_findings: list[dict[str, object]] | None = None,
+    v5_audit: list[dict[str, object]] | None = None,
 ) -> Path:
     """Write current-run findings, including required manual-review metadata."""
     if not re.fullmatch(r"[a-z0-9][a-z0-9_-]*", slug):
@@ -34,5 +37,12 @@ def write_json_report(
         }
         for finding in findings
     ]
-    report_path.write_text(json.dumps(records, indent=2) + "\n", encoding="utf-8")
+    report_data: object = records
+    if v5_taint_findings is not None:
+        report_data = {
+            "findings": records,
+            "v5_taint_findings": v5_taint_findings,
+            "v5_audit": v5_audit if v5_audit is not None else [],
+        }
+    report_path.write_text(json.dumps(report_data, indent=2) + "\n", encoding="utf-8")
     return report_path

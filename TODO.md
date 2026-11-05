@@ -20,12 +20,12 @@
 
 ## M3: Wire parser + taint into scanner as opt-in parallel mode
 
-- [ ] M3: Wire parser + taint into scanner as opt-in parallel mode, compare vs regex, keep V4 output identical when flag off
+- [x] M3: Wire parser + taint into scanner as opt-in parallel mode, compare vs regex, keep V4 output identical when flag off
   - **Goal:** Add an explicit opt-in mode that runs parser/taint alongside existing regex checks while leaving flag-off V4 behavior byte-for-byte compatible for generated outputs.
-  - **Files to touch:** `main.py`, `analyzer/wordpress.py`, `reporter/json_report.py`, focused CLI/report tests, `BOOK.md`, `README.md`.
-  - **Tests to add:** Flag-off golden compatibility tests for exit codes, JSON shape/content, report paths, and duplicate history; opt-in mode/parser failure isolation and comparison output tests.
-  - **Done criteria:** Default behavior remains V4-identical; only explicit opt-in invokes the new analysis; unsupported framework handling remains honest.
-  - **Risks:** Report/history side effects, duplicate handling, and output ordering can accidentally change existing behavior.
+  - **Files to touch:** `main.py`, `analyzer/wordpress.py`, `reporter/json_report.py`, `tests/test_v4_multi.py`, `BOOK.md`, `README.md`.
+  - **Tests to add:** Flag-off/default byte-compatibility tests for output, exit codes, JSON, Markdown, and duplicate history; opt-in V4+taint, sanitizer/auth downgrade, incomplete parser, cross-function, and branch-merge tests.
+  - **Done criteria:** Default and `--engine=regex` retain V4 output and artifacts; only `--engine=taint` adds V5 JSON fields; downgraded and incomplete findings remain visible.
+  - **Risks:** Report/history side effects, duplicate handling, and output ordering can accidentally change existing behavior. The judge authorization check is only a same-function-before-sink stub, not full control-flow proof.
 
 ## M4: New detectors using taint
 

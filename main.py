@@ -25,7 +25,7 @@ from analyzer.wordpress import (
 )
 from duplicate_checker import is_duplicate, record_finding
 from reporter.json_report import write_json_report
-from reporter.patchstack import make_report
+from reporter.patchstack import append_v5_report, make_report
 from tools.download import _extract_archive, get_plugin_local_or_instructions
 
 
@@ -210,6 +210,20 @@ def scan_target(
         record_finding(slug, file_name, line_no, reports_dir=report_root)
         print(f"[report] Saved local review notes to {report_path}")
 
+    if taint_summary is not None:
+        v5_report_path = append_v5_report(
+            slug,
+            [
+                finding
+                for finding in taint_summary.findings
+                if finding.get("status") != "DOWNGRADED"
+            ],
+            taint_summary.audit,
+            report_root,
+        )
+        if v5_report_path is not None:
+            print(f"[report] Saved V5 taint evidence to {v5_report_path}")
+
     return ScanResult(
         findings,
         1
@@ -348,6 +362,19 @@ def scan_source_path(
             report = make_report(slug, finding, reports_dir=report_root)
             record_finding(slug, file_name, line_no, reports_dir=report_root)
             print(f"[report] Saved local review notes to {report}")
+        if taint_summary is not None:
+            v5_report_path = append_v5_report(
+                slug,
+                [
+                    finding
+                    for finding in taint_summary.findings
+                    if finding.get("status") != "DOWNGRADED"
+                ],
+                taint_summary.audit,
+                report_root,
+            )
+            if v5_report_path is not None:
+                print(f"[report] Saved V5 taint evidence to {v5_report_path}")
         print(f"[report] Saved current-run JSON to {report_path}")
         return ScanResult(
             findings,

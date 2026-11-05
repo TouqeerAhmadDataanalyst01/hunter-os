@@ -57,9 +57,9 @@
 
 ## M7: Reporting + docs
 
-- [ ] M7: Reporting + docs - render taint traces, confidence, sanitizer/auth evidence, and audit results in Markdown; update BOOK.md and README.md.
+- [x] M7: Reporting + docs - render taint traces, confidence, sanitizer/auth evidence, and audit results in Markdown; update BOOK.md and README.md.
   - **Goal:** Make V5 evidence and remediation visible while preserving V4 report content when V5 data is absent.
-  - **Files to touch:** `reporter/patchstack.py`, report tests, `BOOK.md`, `README.md`.
-  - **Tests to add:** V4 Markdown byte-compatibility; V5 trace, confidence, remediation, sanitizer/auth evidence, and `v5_audit` sections; safe Markdown escaping.
-  - **Done criteria:** V5 Markdown shows source-to-sink evidence and judge downgrades; docs describe current flags, folder/ZIP input, actual WordPress-only scope, parser and time/file limits.
+  - **Files touched:** `reporter/patchstack.py`, `main.py`, `tests/test_v4_multi.py`, `BOOK.md`, `README.md`, `TODO.md`.
+  - **Tests added:** V4 Markdown byte-compatibility; V5 trace, confidence, remediation, sanitizer/auth evidence, and `v5_audit` sections; Markdown escaping and repeated-section deduplication.
+  - **Done criteria:** V5 Markdown shows source-to-sink evidence and judge downgrades; docs describe current flags, folder/ZIP input, actual WordPress-only scope, parser and time/file limits. Full tests, compile check, and diff check pass.
   - **Risks:** Schema/report drift, unsafe rendering of source-controlled text, or claiming unsupported framework and PHP syntax coverage.

@@ -1,4 +1,4 @@
-# Hunter OS V4: A Practical Guide
+# Hunter OS V5: A Practical Guide
 
 ## Contents
 
@@ -18,9 +18,9 @@
 
 ## 1. What Hunter OS Is
 
-Hunter OS is a Python command-line program for reviewing source code that is already available on your machine. It uses local files, simple pattern checks, and Markdown reports. It does not need API keys, and its scanner does not send source code or scan results to a remote service.
+Hunter OS is a Python command-line program for reviewing source code that is already available on your machine. Its default regex engine preserves V4 behavior; the opt-in taint engine adds bounded analysis over a documented PHP subset and Markdown/JSON evidence. It does not need API keys, and its scanner does not send source code or scan results to a remote service.
 
-The current V4 branch adds project-platform identification and an explicit platform option. It is not yet a multi-language vulnerability scanner: only the existing WordPress-oriented PHP checks run. Laravel, Django, and Node.js projects can be identified, but the program tells you that their security rules are not implemented and skips scanning them.
+It is not a multi-language vulnerability scanner: only WordPress PHP analysis is implemented and tested. Laravel, Django, and Node.js projects can be identified, but their routes and handlers are not analyzed.
 
 A useful mental model is:
 
@@ -31,14 +31,15 @@ A useful mental model is:
 The current implementation can:
 
 - Read plugin slugs from `targets/wordpress.txt`.
-- Use source from a local plugin directory or extract a ZIP already stored in the repository.
+- Use source from configured local plugin directories or ZIPs, or scan a local directory/ZIP path directly.
 - Identify WordPress, Laravel, Django, or Node.js from conventional marker files.
-- Run three existing text-pattern checks on in-scope PHP files for a WordPress project.
+- Run existing regex checks in default/`--engine=regex` mode, or run those checks alongside opt-in bounded PHP taint and WordPress entry-point analysis with `--engine=taint`.
 - List checked files and summarize skipped paths, including oversized, unreadable, and out-of-scope sources.
-- Parse a documented subset of PHP into source-located functions, methods, assignments, calls, returns, and conditional branches. This parser is not yet used by vulnerability detection.
+- Parse a documented subset of PHP into source-located functions, methods, assignments, calls, returns, and conditional branches. Unsupported and malformed syntax is reported as incomplete.
 - Ignore common generated and dependency directories.
 - Look for selected authorization-related tokens near a match and record them as context without suppressing the finding.
-- Write Markdown and JSON reports and keep local duplicate history.
+- Write Markdown and JSON reports, including taint traces/audit evidence in taint mode, and keep local duplicate history.
+- Scan at most 10,000 PHP files in direct folder/ZIP mode; use a cooperative taint timeout between bounded per-file analyses.
 - Preview eligible source paths with `--dry-run` and return meaningful exit codes.
 - Run its tests locally and in GitHub Actions.
 
@@ -205,8 +206,9 @@ The Markdown report contains:
 - A small excerpt of source as evidence.
 - Confidence, nearby-auth context, and an explicit manual-verification flag.
 - Sections for PoC, Impact, and CVSS that explicitly avoid inventing those details.
+- In taint mode, source-to-sink trace steps with file/line locations, confidence, sanitizer and authorization evidence, remediation suggestions, and a separate `v5_audit` section for downgraded findings.
 
-The JSON report `report_json.json` is overwritten each run and describes that run's findings. It includes file, line, type, confidence, auth presence, platform, evidence, status, and `manual_verification_required`.
+The JSON report `report_json.json` is overwritten each run and describes that run's findings. Regex mode keeps the V4 list shape. Taint mode wraps unchanged V4 records in `findings` and adds `v5_taint_findings` and `v5_audit`.
 
 No exploit code or request is generated. The report's PoC section is an authorization and manual-review note.
 
@@ -215,6 +217,8 @@ No exploit code or request is generated. The report's PoC section is an authoriz
 The report is appended to rather than replaced, so multiple findings for one slug can coexist in `reports/<slug>/report_patchstack.md`.
 
 Before appending, the program checks `reports/history.json` for the same plugin slug, relative filename, and line number recorded within 14 days. If found, it prints a duplicate message and skips the report write. A changed line number is considered a new location. Deleting a report does not delete its history, so a repeat may be skipped until the history entry is older than 14 days or is removed manually.
+
+Taint-mode evidence is appended as a V5 section independently of legacy V4 finding history. An identical V5 section is not appended a second time. Regex-only runs do not invoke the V5 renderer and retain their prior Markdown output.
 
 Treat the history file as local workspace data. It is not a remote vulnerability database.
 
@@ -243,6 +247,21 @@ List eligible files without running the heuristics or writing reports:
 ```bash
 python main.py --target my-plugin --dry-run
 ```
+
+Scan a local directory or safely extract and scan a local ZIP:
+
+```bash
+python main.py --engine=taint /path/to/plugin-directory
+python main.py --engine=taint --timeout 60 /path/to/plugin.zip
+```
+
+The direct file form is also available for one PHP file and writes JSON to stdout:
+
+```bash
+python main.py --engine=taint /path/to/plugin.php
+```
+
+Folder/ZIP mass scans are capped at 10,000 PHP files. `--timeout` bounds taint work cooperatively between file analyses; it does not forcibly interrupt a file already being analyzed.
 
 The CLI returns `0` for a clean scan/dry-run, `1` when matches exist, `2` for missing or invalid target/source/archive configuration, `3` for ambiguous or unsupported platform handling, and `4` for internal source-directory or eligible-file listing errors.
 
@@ -292,7 +311,8 @@ Use a valid local ZIP and check for suspicious archive paths, symlinks, oversize
 
 - V4 identifies WordPress, Laravel, Django, and Node.js, but only WordPress has source heuristics today.
 - V4/`--engine=regex` vulnerability checks remain regular expressions. `--engine=taint` adds bounded source-to-sink analysis over a documented PHP subset; it is not a complete PHP AST or full-program data-flow analysis.
-- Taint flows are conservative evidence, not proof of exploitability or authorization failure. Cross-file calls are not modeled, and mass scans cap PHP inputs at 10,000 files with a cooperative taint time budget.
+- WordPress entry-point analysis is limited to tested literal/direct registrations. Cross-file calls, dynamic callbacks, closures, callback arrays, complex permission logic, and many PHP syntax constructs are not modeled.
+- Taint flows are conservative evidence, not proof of exploitability or authorization failure. Mass scans cap PHP inputs at 10,000 files and use a cooperative taint time budget, not a hard process timeout.
 - `LIKELY SAFE` is not proof of safety; absence of a match is not proof that the project is secure.
 - The scanner analyzes local source only and does not execute it, contact external services, or validate behavior in a running application.
 - The project does not generate exploit requests, assign bounty values, or produce verified severity scores.

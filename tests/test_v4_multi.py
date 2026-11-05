@@ -19,6 +19,7 @@ from analyzer.wordpress import scan_plugin, scan_plugin_with_taint
 from duplicate_checker import is_duplicate, record_finding
 from main import main, scan_source_path, scan_target
 from reporter.json_report import write_json_report
+from reporter.patchstack import append_v5_report
 
 
 class PlatformDetectionTests(unittest.TestCase):
@@ -99,6 +100,101 @@ class ExistingWordPressFilterTests(unittest.TestCase):
 
 
 class TaintScannerModeTests(unittest.TestCase):
+    def test_v5_markdown_escapes_untrusted_text_and_deduplicates_sections(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            reports = Path(temporary_directory)
+            findings = [
+                {
+                    "type": "XSS\n## injected heading",
+                    "file": "src`/plugin.php",
+                    "line": 7,
+                    "function": "handler`name",
+                    "confidence": "medium",
+                    "trace": [
+                        {
+                            "kind": "source",
+                            "name": "$_GET `",
+                            "file": "src`/plugin.php",
+                            "line": 2,
+                        }
+                    ],
+                    "sanitizer_evidence": [],
+                    "auth_evidence": [],
+                    "note": "review\n## injected note",
+                }
+            ]
+            audit = [
+                {
+                    "reason": "effective sanitizer\n## injected reason",
+                    "original_confidence": "medium",
+                    "downgraded_confidence": "low",
+                    "sanitizer_evidence": [],
+                    "auth_evidence": [],
+                    "finding": findings[0],
+                }
+            ]
+
+            report_path = append_v5_report(
+                "fixture",
+                findings,
+                audit,
+                reports,
+            )
+            self.assertIsNotNone(report_path)
+            assert report_path is not None
+            rendered = report_path.read_text(encoding="utf-8")
+            original_bytes = report_path.read_bytes()
+            append_v5_report("fixture", findings, audit, reports)
+
+            self.assertIn("source: $_GET", rendered)
+            self.assertIn("``handler`name``", rendered)
+            self.assertNotIn("\n## injected heading", rendered)
+            self.assertNotIn("\n## injected note", rendered)
+            self.assertNotIn("\n## injected reason", rendered)
+            self.assertEqual(report_path.read_bytes(), original_bytes)
+
+    def test_taint_mode_markdown_reports_trace_evidence_and_downgrade_audit(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            source = root / "report-plugin"
+            source.mkdir()
+            (source / "vuln.php").write_text(
+                "<?php\n"
+                "function show(){ $id = $_GET['id']; echo $id; }\n"
+                "function safe(){ $id = sanitize_text_field($_GET['id']); "
+                "echo esc_html($id); }\n",
+                encoding="utf-8",
+            )
+            reports = root / "reports"
+
+            result = scan_source_path(
+                source,
+                engine="taint",
+                reports_dir=reports,
+            )
+
+            report_path = reports / "report-plugin" / "report_patchstack.md"
+            markdown = report_path.read_text(encoding="utf-8")
+            json_report = json.loads(
+                (reports / "report-plugin" / "report_json.json").read_text(
+                    encoding="utf-8"
+                )
+            )
+            self.assertEqual(result.exit_code, 1)
+            self.assertEqual(len(json_report["v5_taint_findings"]), 1)
+            self.assertEqual(len(json_report["v5_audit"]), 1)
+            self.assertIn("## V5 Taint Analysis", markdown)
+            self.assertIn("Cross-Site Scripting (XSS)", markdown)
+            self.assertIn("$_GET", markdown)
+            self.assertIn("echo", markdown)
+            self.assertIn("vuln.php:2", markdown)
+            self.assertIn("**Confidence:** medium", markdown)
+            self.assertIn("Sanitizer evidence", markdown)
+            self.assertIn("Authorization evidence", markdown)
+            self.assertIn("## V5 Audit (`v5_audit`)", markdown)
+            self.assertIn("effective sanitizer", markdown)
+            self.assertIn("function `safe`", markdown)
+
     def test_mass_folder_scan_adds_taint_fields_and_preserves_history_dedupe(self) -> None:
         with tempfile.TemporaryDirectory() as temporary_directory:
             root = Path(temporary_directory)

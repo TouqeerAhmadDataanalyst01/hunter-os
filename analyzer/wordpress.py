@@ -488,7 +488,8 @@ def _finding_from_flow(
             "name": step.name,
             **_location_record(step.location, relative_file),
             "effective_contexts": sorted(
-                next(
+                step.contexts
+                or next(
                     (
                         sanitizer.contexts
                         for sanitizer in DEFAULT_SANITIZERS
@@ -498,13 +499,16 @@ def _finding_from_flow(
                 )
             ),
             "effective": flow.context
-            in next(
-                (
-                    sanitizer.contexts
-                    for sanitizer in DEFAULT_SANITIZERS
-                    if sanitizer.name.casefold() == step.name.casefold()
-                ),
-                frozenset(),
+            in (
+                step.contexts
+                or next(
+                    (
+                        sanitizer.contexts
+                        for sanitizer in DEFAULT_SANITIZERS
+                        if sanitizer.name.casefold() == step.name.casefold()
+                    ),
+                    frozenset(),
+                )
             ),
         }
         for step in flow.sanitizers

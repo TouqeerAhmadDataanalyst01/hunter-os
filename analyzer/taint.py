@@ -87,6 +87,7 @@ class TaintStep:
     kind: str
     name: str
     location: SourceLocation
+    contexts: frozenset[str] = frozenset()
 
 
 @dataclass(frozen=True)
@@ -263,6 +264,447 @@ def _sanitizer_is_effective(sanitizer: SanitizerSpec, call: Call) -> bool:
     return bool(placeholders) and len(placeholders) <= bound_arguments
 
 
+def _function_statements(function: FunctionDef) -> list[Statement]:
+    return _function_statements_from(function.body)
+
+
+def _literal_string_map(expression: str) -> bool:
+    return bool(
+        re.fullmatch(
+            r"\s*\[\s*(?:'[^'\\]*'\s*=>\s*'[^'\\]*'\s*,?\s*)+\]\s*",
+            expression,
+            re.DOTALL,
+        )
+    )
+
+
+def _sql_allowlist_return(
+    function: FunctionDef,
+) -> tuple[str, int | None, int] | None:
+    returns = [
+        statement
+        for statement in _function_statements(function)
+        if isinstance(statement, ReturnStatement) and statement.value is not None
+    ]
+    if len(returns) != 1:
+        return None
+    return_text = returns[0].value.text
+    for statement in _function_statements(function):
+        if not isinstance(statement, Assignment) or not re.fullmatch(
+            r"\$[A-Za-z_][A-Za-z0-9_]*", statement.target
+        ):
+            continue
+        map_name = statement.target
+        if not _literal_string_map(statement.value.text):
+            continue
+        if sum(
+            isinstance(item, Assignment) and item.target == map_name
+            for item in _function_statements(function)
+        ) != 1:
+            continue
+        for parameter in function.parameters:
+            lookup = rf"{re.escape(map_name)}\s*\[\s*{re.escape(parameter)}\s*\]"
+            if re.fullmatch(
+                rf"\s*isset\s*\(\s*{lookup}\s*\)\s*\?\s*{lookup}\s*:\s*"
+                r"""(['"])[^'"\\]*\1\s*""",
+                return_text,
+                re.IGNORECASE,
+            ):
+                return (
+                    f"SQL allowlist validator: {function.class_name or ''}"
+                    f"{'::' if function.class_name else ''}{function.name}",
+                    None,
+                    function.parameters.index(parameter),
+                )
+
+    for parameter in function.parameters:
+        for default_index, default_parameter in enumerate(function.parameters):
+            if default_index == 0:
+                continue
+            enum_return = re.fullmatch(
+                rf"\s*in_array\s*\(\s*{re.escape(parameter)}\s*,\s*"
+                r"\[\s*(?:'[^'\\]*'\s*,\s*)+'[^'\\]*'\s*\]\s*,\s*true\s*\)"
+                rf"\s*\?\s*{re.escape(parameter)}\s*:\s*"
+                rf"{re.escape(default_parameter)}\s*",
+                return_text,
+                re.IGNORECASE,
+            )
+            if enum_return:
+                return (
+                    f"SQL enum validator: {function.class_name or ''}"
+                    f"{'::' if function.class_name else ''}{function.name}",
+                    default_index,
+                    function.parameters.index(parameter),
+                )
+    return None
+
+
+def _target_variable(target: str) -> str | None:
+    match = re.match(r"(\$[A-Za-z_][A-Za-z0-9_]*)", target)
+    return match.group(1) if match else None
+
+
+def _depends_on_variable(
+    starts: tuple[str, ...],
+    target: str,
+    assignments: list[Assignment],
+    max_hops: int = 3,
+) -> bool:
+    dependencies: dict[str, set[str]] = {}
+    for assignment in assignments:
+        variable = _target_variable(assignment.target)
+        if variable is not None:
+            dependencies.setdefault(variable, set()).update(
+                assignment.value.variables
+            )
+    frontier = set(starts)
+    visited: set[str] = set()
+    for _ in range(max_hops + 1):
+        if target in frontier:
+            return True
+        visited.update(frontier)
+        frontier = {
+            dependency
+            for variable in frontier
+            for dependency in dependencies.get(variable, set())
+            if dependency not in visited
+        }
+    return False
+
+
+def _bound_array_is_derived_from(
+    bound_variables: tuple[str, ...],
+    source_variable: str,
+    assignments: list[Assignment],
+) -> bool:
+    if source_variable in bound_variables:
+        return True
+    for bound_variable in bound_variables:
+        writes = [
+            assignment
+            for assignment in assignments
+            if _target_variable(assignment.target) == bound_variable
+        ]
+        if not writes or any(
+            assignment.value.text.strip().casefold() not in {"array()", "[]"}
+            and not any(
+                call.name.casefold() == "array_merge"
+                and bound_variable in call.argument_variables[0]
+                and source_variable in tuple(
+                    variable
+                    for group in call.argument_variables[1:]
+                    for variable in group
+                )
+                for call in assignment.value.calls
+                if call.argument_variables
+            )
+            for assignment in writes
+        ):
+            continue
+        if any(
+            any(
+                call.name.casefold() == "array_merge"
+                and source_variable
+                in tuple(
+                    variable
+                    for group in call.argument_variables[1:]
+                    for variable in group
+                )
+                for call in assignment.value.calls
+                if call.argument_variables
+            )
+            for assignment in writes
+        ):
+            return True
+    return False
+
+
+def _generated_placeholder_binding(
+    call: Call,
+    function: FunctionDef | None,
+    format_values: set[_TaintedValue],
+) -> bool:
+    if function is None or len(call.argument_variables) < 2:
+        return False
+    statements = _function_statements(function)
+    assignments = [
+        statement for statement in statements if isinstance(statement, Assignment)
+    ]
+    format_variables = call.argument_variables[0]
+    bound_variables = call.argument_variables[1]
+    for assignment in assignments:
+        if not assignment.value.text.casefold().count("array_fill"):
+            continue
+        generated = re.search(
+            r"array_fill\s*\(\s*0\s*,\s*count\s*\(\s*(\$[A-Za-z_][A-Za-z0-9_]*)"
+            r"\s*\)\s*,\s*(['\"])(%[sdfi])\2\s*\)",
+            assignment.value.text,
+            re.IGNORECASE,
+        )
+        placeholder_variable = _target_variable(assignment.target)
+        if generated is None or placeholder_variable is None:
+            continue
+        count_variable = generated.group(1)
+        if (
+            "implode" not in assignment.value.text.casefold()
+            or set(assignment.value.variables) != {count_variable}
+        ):
+            continue
+        if (
+            set(format_variables) != {placeholder_variable}
+            and not format_values
+        ):
+            continue
+        if not _depends_on_variable(
+            format_variables, placeholder_variable, assignments
+        ):
+            continue
+        if not _bound_array_is_derived_from(
+            bound_variables, count_variable, assignments
+        ):
+            continue
+        if any(
+            not {
+                "count",
+                "array_fill",
+                "implode",
+            }.issubset({step.name.casefold() for step in value.trace})
+            or count_variable.casefold()
+            not in {step.name.casefold() for step in value.trace}
+            for value in format_values
+        ):
+            continue
+        return True
+    return False
+
+
+def _paired_where_placeholders(
+    call: Call,
+    function: FunctionDef | None,
+    format_values: set[_TaintedValue],
+) -> bool:
+    if function is None or len(call.argument_variables) < 2 or format_values:
+        return False
+    format_text = call.arguments[0]
+    bound_variables = set(call.argument_variables[1])
+    if "implode" not in format_text.casefold():
+        return False
+    template_variables = set(call.argument_variables[0])
+    for nested_call in (
+        call.argument_calls[0] if call.argument_calls else ()
+    ):
+        template_variables.update(
+            variable
+            for group in nested_call.argument_variables
+            for variable in group
+        )
+    if not template_variables or not template_variables.intersection(
+        {f"${name}" for name in ("where_conditions", "conditions")}
+    ):
+        return False
+    template_variable = next(
+        iter(
+            template_variables.intersection(
+                {"$where_conditions", "$conditions"}
+            )
+        )
+    )
+    bound_variable = next(
+        iter(bound_variables.intersection({"$where_values", "$values"})),
+        None,
+    )
+    if bound_variable is None:
+        return False
+    if template_variables != {template_variable}:
+        return False
+
+    all_assignments = [
+        statement
+        for statement in _function_statements(function)
+        if isinstance(statement, Assignment)
+    ]
+    for variable in (template_variable, bound_variable):
+        initializers = [
+            assignment
+            for assignment in all_assignments
+            if assignment.target == variable
+        ]
+        if any(
+            assignment.value.text.strip().casefold() not in {"array()", "[]"}
+            for assignment in initializers
+        ):
+            return False
+    template_appends = [
+        assignment
+        for assignment in all_assignments
+        if assignment.target == f"{template_variable}[]"
+    ]
+    value_appends = [
+        assignment
+        for assignment in all_assignments
+        if assignment.target == f"{bound_variable}[]"
+    ]
+
+    def literal_placeholder_count(expression: str) -> int:
+        literal = re.fullmatch(r"\s*(['\"])(.*?)\1\s*", expression, re.DOTALL)
+        if literal is None:
+            return 0
+        return len(re.findall(r"(?<!%)%[sdfi]", literal.group(2), re.IGNORECASE))
+
+    placeholder_count = sum(
+        literal_placeholder_count(assignment.value.text)
+        for assignment in template_appends
+    )
+    if (
+        not template_appends
+        or placeholder_count != len(value_appends)
+        or len(template_appends) != len(value_appends)
+        or any(
+            literal_placeholder_count(assignment.value.text) != 1
+            for assignment in template_appends
+        )
+    ):
+        return False
+
+    conditional_groups: list[tuple[int, int]] = []
+    pending = list(function.body)
+    while pending:
+        statement = pending.pop()
+        if isinstance(statement, IfStatement):
+            for branch in (statement.then_body, statement.else_body):
+                branch_assignments = [
+                    item
+                    for item in _function_statements_from(branch)
+                    if isinstance(item, Assignment)
+                ]
+                conditions = [
+                    item
+                    for item in branch_assignments
+                    if item.target == f"{template_variable}[]"
+                ]
+                values = [
+                    item
+                    for item in branch_assignments
+                    if item.target == f"{bound_variable}[]"
+                ]
+                if conditions:
+                    conditional_groups.append(
+                        (
+                            sum(
+                                literal_placeholder_count(item.value.text)
+                                for item in conditions
+                            ),
+                            len(values),
+                        )
+                    )
+            pending.extend(statement.then_body)
+            pending.extend(statement.else_body)
+        elif isinstance(statement, ControlStatement):
+            pending.extend(statement.body)
+            for _, branch_body in statement.branches:
+                pending.extend(branch_body)
+    return bool(conditional_groups) and all(
+        placeholders == values for placeholders, values in conditional_groups
+    )
+
+
+def _prepared_call_has_safe_format(
+    call: Call,
+    function: FunctionDef | None,
+    format_values: set[_TaintedValue],
+) -> bool:
+    if len(call.arguments) < 2:
+        return False
+    if (
+        re.fullmatch(r"\s*(['\"]).*\1\s*", call.arguments[0], re.DOTALL)
+        and _sanitizer_is_effective(
+            SanitizerSpec("$wpdb->prepare", frozenset({"sql"})), call
+        )
+        and not format_values
+    ):
+        return True
+    return _generated_placeholder_binding(call, function, format_values) or (
+        _paired_where_placeholders(call, function, format_values)
+    )
+
+
+def _sql_prepared_builder(function: FunctionDef) -> bool:
+    returns = [
+        statement
+        for statement in _function_statements(function)
+        if isinstance(statement, ReturnStatement) and statement.value is not None
+    ]
+    if len(returns) != 1:
+        return False
+    return_expression = returns[0].value
+    implode_calls = [
+        call for call in return_expression.calls if call.name.casefold() == "implode"
+    ]
+    if (
+        len(implode_calls) != 1
+        or not return_expression.text.lstrip().casefold().startswith("implode")
+        or implode_calls[0].end_offset
+        != return_expression.location.offset + len(return_expression.text)
+        or len(implode_calls[0].argument_variables) < 2
+        or len(implode_calls[0].argument_variables[1]) != 1
+    ):
+        return False
+    returned_array = implode_calls[0].argument_variables[1][0]
+    if not returned_array:
+        return False
+    statements = _function_statements(function)
+    appends = [
+        statement
+        for statement in statements
+        if isinstance(statement, Assignment)
+        and statement.target == f"{returned_array}[]"
+    ]
+    if not appends:
+        return False
+    for statement in statements:
+        if (
+            not isinstance(statement, Assignment)
+            or _target_variable(statement.target) != returned_array
+            or statement.target == f"{returned_array}[]"
+        ):
+            continue
+        if statement.value.variables or statement.value.calls:
+            return False
+    for append in appends:
+        value = append.value
+        if not value.variables and not value.calls:
+            continue
+        prepared_call = next(
+            (
+                call
+                for call in value.calls
+                if _call_matches(call.name, "$wpdb->prepare")
+            ),
+            None,
+        )
+        if prepared_call is None or not _prepared_call_has_safe_format(
+            prepared_call, function, set()
+        ):
+            return False
+    return True
+
+
+def _function_statements_from(statements: tuple[Statement, ...]) -> list[Statement]:
+    result: list[Statement] = []
+    pending = list(statements)
+    while pending:
+        statement = pending.pop()
+        result.append(statement)
+        if isinstance(statement, IfStatement):
+            pending.extend(statement.then_body)
+            pending.extend(statement.else_body)
+        elif isinstance(statement, ControlStatement):
+            pending.extend(statement.body)
+            for _, branch_body in statement.branches:
+                pending.extend(branch_body)
+    return result
+
+
 class _Analyzer:
     def __init__(
         self,
@@ -281,6 +723,7 @@ class _Analyzer:
         self.limits = limits
         self.result = TaintAnalysisResult()
         self.steps = 0
+        self.current_function: FunctionDef | None = None
         self.functions: dict[str, list[FunctionDef]] = {}
         self._flow_keys: set[tuple[object, ...]] = set()
         for function in program.functions:
@@ -292,8 +735,14 @@ class _Analyzer:
                     f"{class_def.name}::{method.name}".casefold(), []
                 ).append(method)
 
-    def _step(self, kind: str, name: str, location: SourceLocation) -> TaintStep:
-        return TaintStep(kind, name, location)
+    def _step(
+        self,
+        kind: str,
+        name: str,
+        location: SourceLocation,
+        contexts: frozenset[str] = frozenset(),
+    ) -> TaintStep:
+        return TaintStep(kind, name, location, contexts)
 
     def _diagnose(
         self, message: str, code: str, location: SourceLocation | None = None
@@ -494,7 +943,12 @@ class _Analyzer:
             for variable, values in caller_environment.items():
                 if variable.startswith(receiver_prefix):
                     environment["$this" + variable[len(receiver_name) :]] = set(values)
-        execution = self._execute(function.body, environment, depth)
+        previous_function = self.current_function
+        self.current_function = function
+        try:
+            execution = self._execute(function.body, environment, depth)
+        finally:
+            self.current_function = previous_function
         if receiver_name is not None and caller_environment is not None:
             for variable, values in execution.environment.items():
                 if variable.startswith("$this->"):
@@ -580,12 +1034,22 @@ class _Analyzer:
                 item
                 for item in self.sanitizers
                 if _call_matches(call.name, item.name)
-                and _sanitizer_is_effective(item, call)
+                and (
+                    _prepared_call_has_safe_format(
+                        call,
+                        self.current_function,
+                        arguments[0] if arguments else set(),
+                    )
+                    if item.name.casefold() == "$wpdb->prepare"
+                    else _sanitizer_is_effective(item, call)
+                )
             ),
             None,
         )
         if sanitizer is not None:
-            sanitizer_step = self._step("sanitizer", sanitizer.name, call.location)
+            sanitizer_step = self._step(
+                "sanitizer", sanitizer.name, call.location, sanitizer.contexts
+            )
             return self._bounded_values(
                 {
                     _TaintedValue(
@@ -605,6 +1069,58 @@ class _Analyzer:
         )
         function = self._function_for_call(call.name)
         if function is not None:
+            allowlist = _sql_allowlist_return(function)
+            if allowlist is not None:
+                sanitizer_name, fallback_index, input_index = allowlist
+                non_input_arguments_are_safe = all(
+                    not values
+                    for index, values in enumerate(arguments)
+                    if index != input_index
+                )
+                fallback_is_safe = (
+                    fallback_index is None
+                    or fallback_index >= len(arguments)
+                    or not arguments[fallback_index]
+                )
+                if non_input_arguments_are_safe and fallback_is_safe:
+                    sanitizer_step = self._step(
+                        "sanitizer",
+                        sanitizer_name,
+                        call.location,
+                        frozenset({"sql"}),
+                    )
+                    return self._bounded_values(
+                        {
+                            _TaintedValue(
+                                value.source,
+                                value.trace + (sanitizer_step,),
+                                value.sanitizers + (sanitizer_step,),
+                                value.sanitized_contexts | frozenset({"sql"}),
+                            )
+                            for value in call_values
+                        },
+                        call.location,
+                    )
+            if _sql_prepared_builder(function):
+                sanitizer_step = self._step(
+                    "sanitizer",
+                    f"Prepared SQL builder: {function.class_name or ''}"
+                    f"{'::' if function.class_name else ''}{function.name}",
+                    call.location,
+                    frozenset({"sql"}),
+                )
+                return self._bounded_values(
+                    {
+                        _TaintedValue(
+                            value.source,
+                            value.trace + (sanitizer_step,),
+                            value.sanitizers + (sanitizer_step,),
+                            value.sanitized_contexts | frozenset({"sql"}),
+                        )
+                        for value in call_values
+                    },
+                    call.location,
+                )
             return self._invoke(
                 function,
                 arguments,

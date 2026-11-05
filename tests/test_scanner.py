@@ -787,6 +787,114 @@ class TaintAnalysisTests(unittest.TestCase):
         self.assertEqual(len(result.flows), 2)
         self.assertTrue(all(flow.mitigated for flow in result.flows))
 
+    def test_wpdb_prepare_recognizes_generated_placeholders_bound_to_same_array(self) -> None:
+        result = analyze_program(
+            parse_php(
+                '<?php function query(){ global $wpdb; '
+                '$ids = $_GET["ids"]; '
+                '$placeholders = implode(",", array_fill(0, count($ids), "%d")); '
+                '$sql = $wpdb->prepare('
+                '"SELECT * FROM users WHERE id IN ($placeholders)", $ids); '
+                '$wpdb->get_results($sql); }',
+                "generated-placeholders.php",
+            )
+        )
+
+        self.assertTrue(result.complete, result.diagnostics)
+        self.assertEqual(len(result.flows), 1)
+        self.assertTrue(result.flows[0].mitigated)
+
+    def test_wpdb_prepare_recognizes_paired_dynamic_where_arrays(self) -> None:
+        result = analyze_program(
+            parse_php(
+                '<?php function query(){ global $wpdb; '
+                '$conditions = array(); $values = array(); '
+                'if (!empty($_GET["id"])) { '
+                '$conditions[] = "id = %d"; $values[] = $_GET["id"]; } '
+                '$sql = $wpdb->prepare('
+                '"WHERE 1=1 AND " . implode(" AND ", $conditions), $values); '
+                '$wpdb->get_results($sql); }',
+                "prepared-where-arrays.php",
+            )
+        )
+
+        self.assertTrue(result.complete, result.diagnostics)
+        self.assertEqual(len(result.flows), 1)
+        self.assertTrue(result.flows[0].mitigated)
+
+    def test_prepared_where_builder_is_safe_across_function_boundary(self) -> None:
+        result = analyze_program(
+            parse_php(
+                "<?php class Queries { "
+                "function run(){ global $wpdb; $id = $_GET['id']; "
+                "$where = $this->build_where($id); "
+                "$wpdb->get_results('SELECT * FROM posts WHERE ' . $where); } "
+                "function build_where($id){ global $wpdb; $where = ['1=1']; "
+                "if ($id) { $where[] = $wpdb->prepare('id = %d', $id); } "
+                "return implode(' AND ', $where); } }",
+                "prepared-where-builder.php",
+            )
+        )
+
+        self.assertTrue(result.complete, result.diagnostics)
+        self.assertTrue(result.flows)
+        self.assertTrue(all(flow.mitigated for flow in result.flows))
+
+    def test_wpdb_prepare_does_not_trust_untrusted_query_format(self) -> None:
+        result = analyze_program(
+            parse_php(
+                '<?php function query(){ global $wpdb; '
+                '$sql = $_GET["sql"]; $id = $_GET["id"]; '
+                '$wpdb->get_results($wpdb->prepare('
+                '$sql . " WHERE id=%d", $id)); }',
+                "untrusted-query-format.php",
+            )
+        )
+
+        self.assertTrue(
+            any(not flow.mitigated for flow in result.flows),
+            result.flows,
+        )
+
+    def test_constant_sql_orderby_allowlist_downgrades_tainted_key(self) -> None:
+        result = analyze_program(
+            parse_php(
+                "<?php class Controller { "
+                "function run(){ global $wpdb; "
+                "$sort = $_GET['orderby']; "
+                "$safe = $this->validate_orderby($sort); "
+                "$wpdb->get_results('SELECT * FROM posts ORDER BY ' . $safe); } "
+                "function validate_orderby($orderby){ "
+                "$map = ['title' => 'post_title', 'date' => 'post_date']; "
+                "return isset($map[$orderby]) ? $map[$orderby] : 'post_title'; } "
+                "}",
+                "orderby-allowlist.php",
+            )
+        )
+
+        self.assertTrue(result.complete, result.diagnostics)
+        self.assertTrue(result.flows)
+        self.assertTrue(all(flow.mitigated for flow in result.flows))
+
+    def test_passthrough_validator_does_not_prove_sql_allowlisting(self) -> None:
+        result = analyze_program(
+            parse_php(
+                "<?php class Controller { "
+                "function run(){ global $wpdb; "
+                "$sort = $_GET['orderby']; "
+                "$safe = $this->validate_orderby($sort); "
+                "$wpdb->get_results('SELECT * FROM posts ORDER BY ' . $safe); } "
+                "function validate_orderby($orderby){ return $orderby; } "
+                "}",
+                "passthrough-orderby.php",
+            )
+        )
+
+        self.assertTrue(
+            any(not flow.mitigated for flow in result.flows),
+            result.flows,
+        )
+
     def test_taint_tracks_class_qualified_static_property_assignments(self) -> None:
         result = self.analyze(
             "<?php $value = $_GET['value']; "

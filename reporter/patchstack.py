@@ -11,7 +11,7 @@ DEFAULT_REPORTS_DIR = ROOT / "reports"
 
 REMEDIATION_BY_TYPE = {
     "Cross-Site Scripting (XSS)": (
-        "Escape output for its exact HTML, attribute, or JavaScript context."
+        "Wrap output with esc_html() (or the escaping function for its exact context)."
     ),
     "SQL Injection": (
         "Use parameterized queries or prepared statements; do not concatenate "
@@ -43,6 +43,36 @@ REMEDIATION_BY_TYPE = {
     "WordPress REST Route Authorization": (
         "Require a permission callback that enforces the intended capability; "
         "a nonce alone is not authorization."
+    ),
+}
+
+WHY_BY_TYPE = {
+    "Cross-Site Scripting (XSS)": (
+        "Request-controlled data reaches HTML output without effective output escaping."
+    ),
+    "SQL Injection": (
+        "Request-controlled data reaches a database query without effective preparation."
+    ),
+    "Unauthenticated WordPress AJAX Action": (
+        "A registered AJAX callback performs a sensitive action without proven capability authorization."
+    ),
+    "WordPress REST Route Authorization": (
+        "A REST callback handles tainted data without a proven restrictive permission callback."
+    ),
+    "Directory Traversal / Local File Inclusion": (
+        "Request-controlled data reaches a file path operation."
+    ),
+    "Unsafe File Upload": (
+        "Untrusted upload data reaches a file-handling operation."
+    ),
+    "Command Injection": (
+        "Request-controlled data reaches a command execution operation."
+    ),
+    "Server-Side Request Forgery": (
+        "Request-controlled data reaches an outbound request destination."
+    ),
+    "Hardcoded Secret": (
+        "A credential-like value appears to be embedded in source code."
     ),
 }
 
@@ -119,27 +149,38 @@ def _render_finding(finding: dict[str, object], index: int) -> list[str]:
     lines = [
         f"### {index}. {title}",
         "",
-        f"**Location:** {_markdown_code(location)}",
-        f"**Confidence:** {_markdown_text(finding.get('confidence', 'unknown'))}",
+        f"**File:** {_markdown_code(location)}",
+        (
+            f"**Confidence:** {_markdown_text(finding.get('confidence', 'unknown'))} -- "
+            f"{_markdown_text(finding.get('confidence_reason', 'Manual review required.'))}"
+        ),
+        f"**Entry point:** {_markdown_text(finding.get('entry_point', 'unknown'))}",
         f"**Status:** {_markdown_text(finding.get('status', 'POTENTIAL'))}",
         "",
-        "**Source-to-sink trace:**",
     ]
     trace = finding.get("trace")
     if isinstance(trace, list) and trace:
+        trace_parts: list[str] = []
         for step in trace:
             if not isinstance(step, dict):
-                lines.append(f"- {_markdown_text(step)}")
+                trace_parts.append(_markdown_text(step))
                 continue
-            kind = str(step.get("kind", "step")).replace("\n", " ")
-            name = str(step.get("name", kind)).replace("\n", " ")
-            step_location = _record_location(step, file_name)
-            lines.append(
-                f"- {_markdown_code(f'{kind}: {name}')} at "
-                f"{_markdown_code(step_location)}"
+            name = str(step.get("name", step.get("kind", "step"))).replace("\n", " ")
+            step_line = step.get("line", "?")
+            trace_parts.append(
+                f"line {_markdown_text(step_line)} {_markdown_code(name)}"
             )
+        lines.extend([
+            "",
+            "**Trace:** " + " -> ".join(trace_parts),
+        ])
     else:
-        lines.append("- No trace steps available.")
+        lines.extend(["", "**Trace:** No source-to-sink trace is available."])
+    why = WHY_BY_TYPE.get(
+        finding_type,
+        "Static analysis observed evidence that needs review in its source context.",
+    )
+    lines.extend(["", f"**Why it matters:** {_markdown_text(why)}"])
     lines.extend(["", *_render_evidence(
         "Sanitizer evidence",
         finding.get("sanitizer_evidence"),
@@ -201,17 +242,23 @@ def append_v5_report(
                 finding_record,
                 finding_record.get("file", "<unknown>"),
             )
+            confidence_line = (
+                f"**Confidence:** {_markdown_text(item.get('downgraded_confidence', 'low'))} "
+                "-- analysis incomplete; findings may be absent."
+                if str(item.get("reason", "")).startswith("analysis incomplete")
+                else (
+                    "**Confidence:** "
+                    f"{_markdown_text(item.get('original_confidence', 'unknown'))} "
+                    "downgraded to "
+                    f"{_markdown_text(item.get('downgraded_confidence', 'low'))}"
+                )
+            )
             lines.extend([
                 f"### {index}. {finding_type}",
                 "",
                 f"**Location:** {_markdown_code(location)}",
                 f"**Reason:** {_markdown_text(item.get('reason', 'Not specified'))}",
-                (
-                    "**Confidence:** "
-                    f"{_markdown_text(item.get('original_confidence', 'unknown'))} "
-                    "downgraded to "
-                    f"{_markdown_text(item.get('downgraded_confidence', 'low'))}"
-                ),
+                confidence_line,
                 "",
             ])
             trace = finding_record.get("trace")

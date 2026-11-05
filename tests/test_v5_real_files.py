@@ -4,9 +4,11 @@ import json
 import subprocess
 import sys
 import tempfile
+import time
 import unittest
 from pathlib import Path
 
+from analyzer.wordpress import scan_plugin_with_taint
 from main import scan_source_path
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -46,8 +48,29 @@ class RealFileVerificationTests(unittest.TestCase):
         self.assertEqual(taint_report["findings"], regex_report)
         return taint_report
 
+    def assert_v5_finding_contract(self, report: dict[str, object]) -> None:
+        audit_findings = [
+            item["finding"]
+            for item in report["v5_audit"]
+            if isinstance(item, dict) and isinstance(item.get("finding"), dict)
+        ]
+        for finding in [*active_findings(report), *audit_findings]:
+            with self.subTest(finding=finding):
+                self.assertIn(finding["confidence"], {"high", "medium", "low"})
+                self.assertTrue(finding["confidence_reason"])
+                self.assertTrue(finding["trace"])
+                self.assertTrue(all(step.get("line") for step in finding["trace"]))
+                self.assertIsInstance(finding["sanitizer_evidence"], list)
+                self.assertIsInstance(finding["auth_evidence"], list)
+                self.assertIn(
+                    finding["entry_point"],
+                    {"wp_ajax_", "shortcode", "rest", "direct", "unknown"},
+                )
+                self.assertTrue(finding["note"])
+
     def test_xss_real_files_and_regex_compatibility(self) -> None:
         vulnerable = self.assert_v4_findings_match_regex("vuln_xss.php")
+        self.assert_v5_finding_contract(vulnerable)
         xss = [
             finding for finding in active_findings(vulnerable)
             if finding["type"] == "Cross-Site Scripting (XSS)"
@@ -61,6 +84,7 @@ class RealFileVerificationTests(unittest.TestCase):
         )
 
         safe = self.assert_v4_findings_match_regex("safe_xss.php")
+        self.assert_v5_finding_contract(safe)
         self.assertFalse(active_findings(safe))
         self.assertTrue(any(
             item["finding"]["function"] == "safe"
@@ -70,6 +94,7 @@ class RealFileVerificationTests(unittest.TestCase):
 
     def test_sqli_real_files_and_regex_compatibility(self) -> None:
         vulnerable = self.assert_v4_findings_match_regex("vuln_sqli.php")
+        self.assert_v5_finding_contract(vulnerable)
         sqli = [
             finding for finding in active_findings(vulnerable)
             if finding["type"] == "SQL Injection"
@@ -83,6 +108,7 @@ class RealFileVerificationTests(unittest.TestCase):
         ))
 
         safe = self.assert_v4_findings_match_regex("safe_sqli.php")
+        self.assert_v5_finding_contract(safe)
         self.assertFalse(active_findings(safe))
         self.assertTrue(any(
             item["reason"] == "effective sanitizer"
@@ -92,6 +118,7 @@ class RealFileVerificationTests(unittest.TestCase):
 
     def test_ajax_real_files_and_regex_compatibility(self) -> None:
         vulnerable = self.assert_v4_findings_match_regex("vuln_ajax.php")
+        self.assert_v5_finding_contract(vulnerable)
         ajax_findings = [
             finding for finding in active_findings(vulnerable)
             if finding["type"] == "Unauthenticated WordPress AJAX Action"
@@ -104,6 +131,7 @@ class RealFileVerificationTests(unittest.TestCase):
         self.assertEqual(len(active_findings(vulnerable)), 1)
 
         safe = self.assert_v4_findings_match_regex("safe_ajax.php")
+        self.assert_v5_finding_contract(safe)
         self.assertFalse(active_findings(safe))
         self.assertTrue(any(
             item["finding"]["type"] == "Unauthenticated WordPress AJAX Action"
@@ -112,11 +140,13 @@ class RealFileVerificationTests(unittest.TestCase):
 
     def test_rest_and_traversal_real_files_and_regex_compatibility(self) -> None:
         rest = self.assert_v4_findings_match_regex("vuln_rest.php")
+        self.assert_v5_finding_contract(rest)
         rest_types = {finding["type"] for finding in active_findings(rest)}
         self.assertIn("WordPress REST Route Authorization", rest_types)
         self.assertIn("Cross-Site Scripting (XSS)", rest_types)
 
         traversal = self.assert_v4_findings_match_regex("vuln_traversal.php")
+        self.assert_v5_finding_contract(traversal)
         traversal_findings = [
             finding for finding in active_findings(traversal)
             if finding["type"] == "Directory Traversal / Local File Inclusion"
@@ -155,6 +185,62 @@ class RealFileVerificationTests(unittest.TestCase):
         self.assertIn("V5 Taint Analysis", markdown)
         self.assertIn("Source-to-sink trace", markdown)
         self.assertIn("V5 Audit (`v5_audit`)", markdown)
+
+    def test_fifty_file_folder_scan_finishes_within_thirty_seconds(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            source = root / "fifty-plugin"
+            source.mkdir()
+            for index in range(50):
+                (source / f"file-{index}.php").write_text(
+                    "<?php echo $_GET['value'];",
+                    encoding="utf-8",
+                )
+
+            started = time.perf_counter()
+            result = scan_source_path(
+                source,
+                engine="taint",
+                reports_dir=root / "reports",
+            )
+            elapsed = time.perf_counter() - started
+
+        self.assertEqual(result.exit_code, 1)
+        self.assertLess(elapsed, 30)
+
+    def test_nonce_is_not_auth_and_blog_capability_is_recognized(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            (root / "nonce.php").write_text(
+                "<?php add_action('wp_ajax_nopriv_delete', 'del'); "
+                "function del(){ check_ajax_referer('delete'); "
+                "wp_delete_post($_POST['id']); }",
+                encoding="utf-8",
+            )
+            (root / "guarded.php").write_text(
+                "<?php function guarded(){ "
+                "if(!current_user_can_for_blog(1, 'delete_posts')) return; "
+                "wp_delete_post($_POST['id']); }",
+                encoding="utf-8",
+            )
+
+            result = scan_plugin_with_taint(root)
+
+        nonce_findings = [
+            item for item in result.findings
+            if item["type"] == "Unauthenticated WordPress AJAX Action"
+            and item["file"] == "nonce.php"
+        ]
+        guarded_findings = [
+            item for item in result.findings
+            if item["file"] == "guarded.php"
+        ]
+        self.assertEqual(len(nonce_findings), 1)
+        self.assertEqual(nonce_findings[0]["note"], "nonce is not auth")
+        self.assertTrue(any(
+            item["finding"]["file"] == "guarded.php"
+            for item in result.audit
+        ))
 
 
 if __name__ == "__main__":

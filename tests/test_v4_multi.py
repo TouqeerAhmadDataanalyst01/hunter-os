@@ -189,6 +189,9 @@ class TaintScannerModeTests(unittest.TestCase):
             self.assertIn("echo", markdown)
             self.assertIn("vuln.php:2", markdown)
             self.assertIn("**Confidence:** medium", markdown)
+            self.assertIn("**Trace:** line 2 `$_GET` ->", markdown)
+            self.assertIn("**Why it matters:**", markdown)
+            self.assertIn("**Fix suggestion:**", markdown)
             self.assertIn("Sanitizer evidence", markdown)
             self.assertIn("Authorization evidence", markdown)
             self.assertIn("## V5 Audit (`v5_audit`)", markdown)
@@ -276,7 +279,7 @@ class TaintScannerModeTests(unittest.TestCase):
                 "<?php function broken(){ echo $_GET['x'];",
                 encoding="utf-8",
             )
-            (source / "large.php").write_bytes(b"x" * 2_000_001)
+            (source / "large.php").write_bytes(b"x" * 10_000_000)
 
             result = scan_source_path(
                 source,
@@ -299,6 +302,15 @@ class TaintScannerModeTests(unittest.TestCase):
                 for finding in report["v5_taint_findings"]
                 if finding["type"] == "Incomplete taint analysis"
             ))
+            warning_files = {
+                item["finding"]["file"]
+                for item in report["v5_audit"]
+                if item["reason"].startswith("analysis incomplete")
+            }
+            self.assertEqual(
+                warning_files,
+                {"empty.php", "broken.php", "large.php"},
+            )
 
     def test_taint_mass_scan_surfaces_timeout_and_file_count_limits(self) -> None:
         with tempfile.TemporaryDirectory() as temporary_directory:
@@ -338,6 +350,34 @@ class TaintScannerModeTests(unittest.TestCase):
                 item["type"] == "Incomplete taint analysis"
                 and "file analysis limit" in item["note"]
                 for item in report["v5_taint_findings"]
+            ))
+            self.assertTrue(any(
+                item["finding"]["file"] == "<scan>"
+                for item in report["v5_audit"]
+            ))
+
+    def test_taint_per_file_timeout_is_preserved_in_audit(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            source = Path(temporary_directory)
+            (source / "slow.php").write_text(
+                "<?php echo $_GET['value'];",
+                encoding="utf-8",
+            )
+            with patch(
+                "analyzer.wordpress.time.perf_counter",
+                side_effect=[0.0, 6.0],
+            ):
+                result = scan_plugin_with_taint(source)
+
+            self.assertFalse(result.complete)
+            self.assertTrue(any(
+                item["code"] == "per_file_timeout"
+                for item in result.diagnostics
+            ))
+            self.assertTrue(any(
+                item["finding"]["file"] == "slow.php"
+                and "Per-file taint analysis exceeded" in item["note"]
+                for item in result.audit
             ))
 
     def test_real_file_wordpress_entrypoints_cover_ajax_shortcode_and_rest(self) -> None:
@@ -423,7 +463,7 @@ class TaintScannerModeTests(unittest.TestCase):
                 if item["type"] == "WordPress REST Route Authorization"
             ]
             self.assertEqual(
-                {item["entry_point"]["route"] for item in rest_findings},
+                {item["entry_point_details"]["route"] for item in rest_findings},
                 {"/missing", "/open"},
             )
             self.assertTrue(
@@ -472,7 +512,7 @@ class TaintScannerModeTests(unittest.TestCase):
                 if item["type"] == "WordPress REST Route Authorization"
             ]
             self.assertEqual(
-                {item["entry_point"]["route"] for item in routes}, {"/open"}
+                {item["entry_point_details"]["route"] for item in routes}, {"/open"}
             )
 
     def test_real_file_cli_reports_only_unsanitized_xss(self) -> None:

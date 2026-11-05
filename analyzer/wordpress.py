@@ -33,6 +33,7 @@ from analyzer.taint import (
     DEFAULT_SANITIZERS,
     TaintAnalysisResult,
     TaintFlow,
+    TaintLimits,
     TaintSource,
     analyze_program,
 )
@@ -46,6 +47,22 @@ AUTH_CHECK_PATTERN = re.compile(
     re.IGNORECASE,
 )
 MAX_SOURCE_BYTES = 2_000_000
+MAX_FILE_ANALYSIS_SECONDS = 5.0
+MAX_CALL_DEPTH = 3
+NONCE_CALLS = {
+    "wp_nonce",
+    "wp_create_nonce",
+    "wp_nonce_field",
+    "wp_nonce_url",
+    "check_ajax_referer",
+    "check_admin_referer",
+    "wp_verify_nonce",
+}
+AUTH_CALLS = {
+    "current_user_can",
+    "current_user_can_for_blog",
+    "user_can",
+}
 
 
 @dataclass
@@ -313,7 +330,7 @@ def _condition_auth_call(statement: IfStatement) -> tuple[Call, bool] | None:
         call
         for call in statement.condition.calls
         if call.name.rsplit("->", 1)[-1].rsplit("::", 1)[-1].casefold()
-        in {"current_user_can", "user_can"}
+        in AUTH_CALLS
     ]
     if len(calls) != 1 or len(statement.condition.calls) != 1:
         return None
@@ -514,6 +531,15 @@ def _finding_from_flow(
             and all(step.kind == "assignment" for step in flow.trace[:-1])
             else "medium"
         ),
+        "confidence_reason": (
+            "Direct unescaped request data reaches HTML output through assignments."
+            if flow.context == "html"
+            and not flow.sanitizers
+            and bool(flow.trace)
+            and flow.trace[-1].kind == "sink"
+            and all(step.kind == "assignment" for step in flow.trace[:-1])
+            else "A bounded source-to-sink path was observed; exploitability needs manual review."
+        ),
         "context": flow.context,
         "function": _function_name_for_location(program, flow.sink.location),
         "source": source,
@@ -644,7 +670,7 @@ def _permission_callback_proof(
                 expression.calls[0].name.casefold()
             )
             and expression.calls[0].name.rsplit("->", 1)[-1].rsplit("::", 1)[-1].casefold()
-            in {"current_user_can", "user_can"}
+            in AUTH_CALLS
         ):
             call = expression.calls[0]
             evidence.append(
@@ -745,10 +771,10 @@ def _wordpress_framework_findings(
                 }
                 for call in function_calls
                 if call.name.rsplit("->", 1)[-1].rsplit("::", 1)[-1].casefold()
-                in {"check_ajax_referer", "wp_verify_nonce", "check_admin_referer"}
+                in NONCE_CALLS
             ]
             nonce_note = (
-                " Nonce verification is not authorization proof; nonce is not auth."
+                " nonce is not auth"
                 if nonce_evidence and not auth_evidence
                 else (
                     " missing current_user_can authorization proof."
@@ -892,10 +918,12 @@ def _annotate_entry_points(
         _program_functions(program),
     )
     records_by_callback: dict[str, list[dict[str, object]]] = {}
+    functions_by_callback: dict[str, FunctionDef] = {}
     for entry_point, function in resolved:
         records_by_callback.setdefault(function.name.casefold(), []).append(
             _entry_point_record(entry_point)
         )
+        functions_by_callback[function.name.casefold()] = function
     for finding in findings:
         if finding.get("file") != relative_file:
             continue
@@ -906,6 +934,24 @@ def _annotate_entry_points(
         entry_points = records_by_callback.get(short_name)
         if entry_points:
             finding["entry_points"] = entry_points
+            function = functions_by_callback.get(short_name)
+            if function is not None:
+                nonce_evidence = [
+                    {
+                        "name": call.name,
+                        "file": relative_file,
+                        "line": call.location.line,
+                    }
+                    for call in _scope_calls(tuple(function.body))
+                    if call.name.rsplit("->", 1)[-1]
+                    .rsplit("::", 1)[-1]
+                    .casefold()
+                    in NONCE_CALLS
+                ]
+                if nonce_evidence:
+                    finding["nonce_evidence"] = nonce_evidence
+                    if not finding.get("auth_evidence"):
+                        finding["note"] = "nonce is not auth"
 
 
 def _judge_taint_findings(
@@ -926,13 +972,19 @@ def _judge_taint_findings(
         if not reasons:
             continue
         original_confidence = finding["confidence"]
+        original_confidence_reason = finding["confidence_reason"]
         finding["confidence"] = "low"
+        finding["confidence_reason"] = (
+            "The judge found context-effective sanitizer or authorization evidence; "
+            "the finding is retained for review."
+        )
         finding["status"] = "DOWNGRADED"
         audit.append(
             {
                 "finding_index": index,
                 "reason": "; ".join(reasons),
                 "original_confidence": original_confidence,
+                "original_confidence_reason": original_confidence_reason,
                 "downgraded_confidence": "low",
                 "sanitizer_evidence": sanitizer_evidence,
                 "auth_evidence": auth_evidence,
@@ -941,6 +993,93 @@ def _judge_taint_findings(
             }
         )
     return audit
+
+
+def _ensure_v5_finding_contract(finding: dict[str, object]) -> None:
+    confidence = str(finding.get("confidence", "low")).casefold()
+    if confidence not in {"high", "medium", "low"}:
+        confidence = "low"
+    finding["confidence"] = confidence
+    finding.setdefault(
+        "confidence_reason",
+        (
+            "Analysis is incomplete; treat this as a warning, not a confirmed issue."
+            if finding.get("status") == "INCOMPLETE"
+            else "A bounded static-analysis heuristic found a path requiring manual review."
+        ),
+    )
+    trace = finding.get("trace")
+    if not isinstance(trace, list):
+        finding["trace"] = []
+    for step in finding["trace"]:
+        if isinstance(step, dict):
+            step.setdefault("line", finding.get("line", 1))
+    finding.setdefault("sanitizer_evidence", [])
+    finding.setdefault("auth_evidence", [])
+    finding.setdefault("note", "Manual review is required.")
+
+    entry_point = finding.get("entry_point")
+    if isinstance(entry_point, dict):
+        finding["entry_point_details"] = entry_point
+        entry_kind = entry_point.get("type")
+        finding["entry_point"] = (
+            "wp_ajax_"
+            if entry_kind == "ajax"
+            else str(entry_kind)
+            if entry_kind in {"rest", "shortcode"}
+            else "unknown"
+        )
+    elif isinstance(entry_point, str) and entry_point in {
+        "wp_ajax_",
+        "rest",
+        "shortcode",
+        "direct",
+        "unknown",
+    }:
+        pass
+    else:
+        entries = finding.get("entry_points")
+        entry_types = [
+            item.get("type")
+            for item in entries
+            if isinstance(item, dict)
+        ] if isinstance(entries, list) else []
+        if "ajax" in entry_types:
+            finding["entry_point"] = "wp_ajax_"
+        elif "rest" in entry_types:
+            finding["entry_point"] = "rest"
+        elif "shortcode" in entry_types:
+            finding["entry_point"] = "shortcode"
+        elif finding.get("function") is None:
+            finding["entry_point"] = "direct"
+        else:
+            finding["entry_point"] = "unknown"
+
+    nonce_evidence = finding.get("nonce_evidence")
+    auth_evidence = finding.get("auth_evidence")
+    if nonce_evidence and not auth_evidence:
+        finding["note"] = "nonce is not auth"
+
+
+def _finalize_taint_summary(summary: TaintScanSummary) -> None:
+    for finding in summary.findings:
+        _ensure_v5_finding_contract(finding)
+    summary.audit = _judge_taint_findings(summary.findings)
+    for finding in summary.findings:
+        if finding.get("status") != "INCOMPLETE":
+            continue
+        summary.audit.append(
+            {
+                "reason": "analysis incomplete; manual review required",
+                "original_confidence": finding["confidence"],
+                "original_confidence_reason": finding["confidence_reason"],
+                "downgraded_confidence": "low",
+                "sanitizer_evidence": finding["sanitizer_evidence"],
+                "auth_evidence": finding["auth_evidence"],
+                "finding": dict(finding),
+                "note": finding["note"],
+            }
+        )
 
 
 def _incomplete_finding(
@@ -955,9 +1094,11 @@ def _incomplete_finding(
         "type": "Incomplete taint analysis",
         "status": "INCOMPLETE",
         "confidence": "low",
+        "confidence_reason": "Analysis could not fully assess this source file.",
         "trace": [],
         "sanitizer_evidence": [],
         "auth_evidence": [],
+        "entry_point": "unknown",
         "note": f"incomplete parse: {message}" if kind == "incomplete_parse" else message,
     }
 
@@ -1006,7 +1147,30 @@ def scan_plugin_with_taint(
             )
             break
         relative_file = source_file.relative_to(root).as_posix()
+        file_started = time.perf_counter()
         _analyze_taint_file(source_file, relative_file, result)
+        file_elapsed = time.perf_counter() - file_started
+        if file_elapsed >= MAX_FILE_ANALYSIS_SECONDS:
+            result.complete = False
+            message = (
+                f"Per-file taint analysis exceeded {MAX_FILE_ANALYSIS_SECONDS:g} seconds"
+            )
+            result.diagnostics.append(
+                {
+                    "file": relative_file,
+                    "line": 1,
+                    "code": "per_file_timeout",
+                    "message": message,
+                }
+            )
+            result.findings.append(
+                _incomplete_finding(
+                    relative_file,
+                    1,
+                    message,
+                    "per_file_timeout",
+                )
+            )
         if (
             timeout_seconds is not None
             and time.monotonic() - started >= timeout_seconds
@@ -1044,13 +1208,45 @@ def scan_plugin_with_taint(
             _incomplete_finding("<scan>", 1, message, "file_count_limit")
         )
 
-    result.audit = _judge_taint_findings(result.findings)
+    _finalize_taint_summary(result)
     return result
 
 
 def _analyze_taint_file(
     source_file: Path, relative_file: str, result: TaintScanSummary
 ) -> None:
+    try:
+        if source_file.stat().st_size == 0:
+            message = "Empty PHP file skipped; no source was analyzed."
+            result.complete = False
+            result.diagnostics.append(
+                {
+                    "file": relative_file,
+                    "line": 1,
+                    "code": "empty_file",
+                    "message": message,
+                }
+            )
+            result.findings.append(
+                _incomplete_finding(relative_file, 1, message, "empty_file")
+            )
+            return
+    except OSError as error:
+        message = f"Could not inspect PHP file: {error}"
+        result.complete = False
+        result.diagnostics.append(
+            {
+                "file": relative_file,
+                "line": 1,
+                "code": "read_error",
+                "message": message,
+            }
+        )
+        result.findings.append(
+            _incomplete_finding(relative_file, 1, message, "read_error")
+        )
+        return
+
     program = parse_php_file(source_file)
     if not program.complete:
         result.complete = False
@@ -1090,6 +1286,7 @@ def _analyze_taint_file(
         analysis: TaintAnalysisResult = analyze_program(
             program,
             sources=DEFAULT_SOURCES + rest_request_sources,
+            limits=TaintLimits(max_call_depth=MAX_CALL_DEPTH),
         )
         if not analysis.complete:
             result.complete = False
@@ -1200,7 +1397,7 @@ def scan_php_file_with_taint(
     regex_summary = scan_php_file_with_summary(path)
     taint_summary = TaintScanSummary()
     _analyze_taint_file(source_file, source_file.name, taint_summary)
-    taint_summary.audit = _judge_taint_findings(taint_summary.findings)
+    _finalize_taint_summary(taint_summary)
     return regex_summary, taint_summary
 
 

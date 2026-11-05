@@ -23,6 +23,7 @@ from analyzer.wordpress import (
     scan_php_file_with_summary,
     TaintScanSummary,
     _incomplete_finding,
+    _finalize_taint_summary,
 )
 from duplicate_checker import is_duplicate, record_finding
 from reporter.json_report import write_json_report
@@ -173,6 +174,7 @@ def scan_target(
                     }
                 ],
             )
+            _finalize_taint_summary(taint_summary)
         finally:
             executor.shutdown(wait=True, cancel_futures=True)
     else:
@@ -347,6 +349,7 @@ def scan_source_path(
                         }
                     ],
                 )
+                _finalize_taint_summary(taint_summary)
             finally:
                 executor.shutdown(wait=True, cancel_futures=True)
         else:
@@ -446,7 +449,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument(
         "source_file",
         nargs="?",
-        help="scan one PHP file directly (requires --engine=taint)",
+        help="scan one PHP file, or scan a folder/ZIP with either engine",
     )
     args = parser.parse_args(argv)
 

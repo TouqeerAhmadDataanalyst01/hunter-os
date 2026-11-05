@@ -29,7 +29,7 @@ class TaintSource:
     kind: str = "variable"
 
     def __post_init__(self) -> None:
-        if self.kind not in {"variable", "call"}:
+        if self.kind not in {"variable", "call", "literal"}:
             raise ValueError(f"Unsupported taint source kind: {self.kind}")
 
 
@@ -53,7 +53,7 @@ class PropagatorSpec:
 
 @dataclass(frozen=True)
 class TaintLimits:
-    max_call_depth: int = 8
+    max_call_depth: int = 3
     max_steps: int = 100_000
     max_flows: int = 10_000
     max_values_per_variable: int = 10_000
@@ -100,7 +100,18 @@ class TaintAnalysisResult:
 
 
 DEFAULT_SOURCES = (
-    *(TaintSource(name) for name in ("$_GET", "$_POST", "$_REQUEST", "$_COOKIE", "$_FILES")),
+    *(
+        TaintSource(name)
+        for name in (
+            "$_GET",
+            "$_POST",
+            "$_REQUEST",
+            "$_COOKIE",
+            "$_FILES",
+            "$_SERVER['PHP_SELF']",
+        )
+    ),
+    TaintSource("php://input", "literal"),
     *(TaintSource(name, "call") for name in (
         "filter_input",
         "get_param",
@@ -161,14 +172,18 @@ DEFAULT_SINKS = (
 
 DEFAULT_SANITIZERS = (
     SanitizerSpec("esc_html", frozenset({"html"})),
-    SanitizerSpec("esc_attr", frozenset({"html_attribute"})),
-    SanitizerSpec("esc_url", frozenset({"url"})),
+    SanitizerSpec("esc_attr", frozenset({"html", "html_attribute"})),
+    SanitizerSpec("esc_url", frozenset({"html", "url"})),
+    SanitizerSpec("esc_textarea", frozenset({"html"})),
     SanitizerSpec("wp_kses", frozenset({"html"})),
     SanitizerSpec("wp_kses_post", frozenset({"html"})),
     SanitizerSpec("$wpdb->prepare", frozenset({"sql"})),
     SanitizerSpec("esc_sql", frozenset({"sql"})),
+    SanitizerSpec("intval", frozenset({"sql", "html", "html_attribute"})),
+    SanitizerSpec("absint", frozenset({"sql", "html", "html_attribute"})),
     SanitizerSpec("sanitize_file_name", frozenset({"filename"})),
     SanitizerSpec("sanitize_text_field", frozenset({"input_validation"})),
+    SanitizerSpec("sanitize_email", frozenset({"input_validation"})),
     SanitizerSpec("wp_check_filetype", frozenset({"file_type"})),
     SanitizerSpec("wp_verify_nonce", frozenset({"nonce"})),
 )
@@ -341,11 +356,22 @@ class _Analyzer:
         return values
 
     def _call_source(self, call: Call) -> set[_TaintedValue]:
-        return {
+        sources = {
             _TaintedValue(self._step("source", source.name, call.location))
             for source in self.sources
             if source.kind == "call" and _call_matches(call.name, source.name)
         }
+        literal_arguments = {
+            argument.strip().strip("\"'").casefold()
+            for argument in call.arguments
+        }
+        sources.update(
+            _TaintedValue(self._step("source", source.name, call.location))
+            for source in self.sources
+            if source.kind == "literal"
+            and source.name.casefold() in literal_arguments
+        )
+        return sources
 
     def _function_for_call(self, call_name: str) -> FunctionDef | None:
         exact = self.functions.get(call_name.casefold(), [])

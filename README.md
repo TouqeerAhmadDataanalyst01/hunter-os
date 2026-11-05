@@ -8,6 +8,8 @@ The parser remains an explicitly bounded PHP subset, not a complete PHP AST. Lar
 
 Use Python 3.10 or newer. No packages or API keys are needed. Configured plugin source must already exist in `targets/plugins/<slug>/` or `targets/archives/<slug>.zip`; direct folder and ZIP inputs are read from their supplied local paths. The program never downloads targets or contacts vulnerability databases.
 
+`--engine=regex` is the V4-compatible default. `--engine=taint` adds bounded WordPress/PHP analysis for source flows to HTML output, SQL, file paths, uploads, command execution, and outbound requests; it also checks selected AJAX and REST entry points and credential-like literals. It does not model all PHP syntax, prove exploitability, or analyze Laravel, Django, Node.js, or cross-file flows. Input filtering is not treated as output escaping, a nonce is not authorization, and uncertain/incomplete parses remain visible for review.
+
 ```bash
 python main.py --target vuln-test
 python main.py --target vuln-test --dry-run
@@ -19,5 +21,7 @@ python -m unittest discover -s tests -v
 ```
 
 Plugin-scan results are written to `reports/<slug>/report_patchstack.md` and `reports/<slug>/report_json.json`. Folder/ZIP scan reports use a slug derived from the supplied path. Duplicate history is local at `reports/history.json`. The direct-file form writes its combined V4/V5 JSON result to stdout. Every match is a heuristic requiring manual verification; nearby auth tokens are recorded as context and do not suppress a match. Regex mode remains the default and preserves V4 report behavior.
+
+Example V5 Markdown trace: `line 3 $_GET -> line 3 $id -> line 3 echo`. Confidence describes the analyzer's evidence, not confirmed exploitability. Sanitizer/auth evidence and downgraded or incomplete cases are listed in the report's `v5_audit` section.
 
 See [MANUAL.md](MANUAL.md) for a quick start and [BOOK.md](BOOK.md) for the full guide. GitHub Actions runs tests and compilation only; it does not scan plugin targets.

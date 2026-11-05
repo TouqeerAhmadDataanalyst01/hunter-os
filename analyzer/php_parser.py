@@ -9,6 +9,7 @@ from pathlib import Path
 
 
 MAX_PHP_SOURCE_BYTES = 2_000_000
+MAX_PHP_LINES = 500
 MAX_PHP_TOKENS = 200_000
 MAX_NESTED_CONDITIONALS = 128
 MAX_NESTED_CALLS = 128
@@ -298,6 +299,13 @@ class _Lexer:
                 f"PHP source exceeds {MAX_PHP_SOURCE_BYTES} bytes",
                 0,
                 "source_limit",
+            )
+            return []
+        if source.count("\n") + 1 > MAX_PHP_LINES:
+            self._diagnose(
+                f"PHP source exceeds {MAX_PHP_LINES} lines",
+                0,
+                "line_limit",
             )
             return []
 
@@ -985,8 +993,26 @@ class _Parser:
         self, tokens: list[_Token]
     ) -> list[tuple[str, SourceLocation]]:
         variables: list[tuple[str, SourceLocation]] = []
-        for token in tokens:
+        for index, token in enumerate(tokens):
             if token.kind == "variable":
+                if (
+                    token.value.casefold() == "$_server"
+                    and index + 3 < len(tokens)
+                    and tokens[index + 1].value == "["
+                    and tokens[index + 3].value == "]"
+                ):
+                    key = tokens[index + 2]
+                    if (
+                        key.kind == "string"
+                        and key.value[1:-1].casefold() == "php_self"
+                    ):
+                        variables.append(
+                            (
+                                "$_SERVER['PHP_SELF']",
+                                self.location(token.start),
+                            )
+                        )
+                        continue
                 variables.append((token.value, self.location(token.start)))
             elif token.kind == "string" and token.value.startswith('"'):
                 for match in re.finditer(

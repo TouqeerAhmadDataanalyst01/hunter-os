@@ -14,6 +14,7 @@ from analyzer.wordpress import MAX_SOURCE_BYTES, scan_plugin, scan_plugin_with_s
 from analyzer.php_parser import (
     CallStatement,
     GlobalStatement,
+    MAX_PHP_LINES,
     MAX_NESTED_CALLS,
     OutputStatement,
     parse_php,
@@ -434,6 +435,14 @@ class PhpParserTests(unittest.TestCase):
             (("$file",),),
         )
 
+    def test_parser_marks_line_limit_as_incomplete(self) -> None:
+        program = parse_php("<?php\n" + "\n" * MAX_PHP_LINES)
+
+        self.assertFalse(program.complete)
+        self.assertTrue(any(
+            item.code == "line_limit" for item in program.diagnostics
+        ))
+
 
 class TaintAnalysisTests(unittest.TestCase):
     sources = (TaintSource("$_GET"), TaintSource("$_POST"))
@@ -455,6 +464,79 @@ class TaintAnalysisTests(unittest.TestCase):
                 self.assertTrue(result.complete)
                 self.assertEqual(len(result.flows), 1)
                 self.assertEqual(result.flows[0].source.name, source)
+
+    def test_contextual_sanitizers_are_recognized_without_overclaiming_input_filters(self) -> None:
+        for sanitizer in (
+            "esc_html",
+            "esc_attr",
+            "esc_url",
+            "esc_textarea",
+            "wp_kses",
+            "wp_kses_post",
+            "intval",
+            "absint",
+        ):
+            with self.subTest(sanitizer=sanitizer):
+                result = analyze_program(
+                    parse_php(
+                        f"<?php echo {sanitizer}($_GET['value']);",
+                        "sanitizer.php",
+                    ),
+                    sinks=(TaintSink("echo", "html"),),
+                )
+                self.assertEqual(len(result.flows), 1)
+                self.assertTrue(result.flows[0].mitigated)
+        for sanitizer in ("sanitize_text_field", "sanitize_email"):
+            with self.subTest(sanitizer=sanitizer):
+                result = analyze_program(
+                    parse_php(
+                        f"<?php echo {sanitizer}($_GET['value']);",
+                        "input-filter.php",
+                    ),
+                    sinks=(TaintSink("echo", "html"),),
+                )
+                self.assertEqual(len(result.flows), 1)
+                self.assertFalse(result.flows[0].mitigated)
+
+    def test_default_call_depth_is_bounded_to_three(self) -> None:
+        source = (
+            "<?php function first($x){ return second($x); } "
+            "function second($x){ return third($x); } "
+            "function third($x){ return fourth($x); } "
+            "function fourth($x){ echo $x; } "
+            "$value = first($_GET['x']);"
+        )
+        result = analyze_program(parse_php(source, "depth.php"))
+
+        self.assertFalse(result.complete)
+        self.assertTrue(any(
+            item.code == "call_depth_limit" for item in result.diagnostics
+        ))
+
+    def test_php_self_php_input_indirect_return_and_array_taint(self) -> None:
+        examples = (
+            ("<?php echo $_SERVER['PHP_SELF'];", "$_SERVER['PHP_SELF']"),
+            (
+                "<?php $body = file_get_contents('php://input'); echo $body;",
+                "php://input",
+            ),
+            ("<?php $a = $_GET['x']; $b = $a; echo $b;", "$_GET"),
+            (
+                "<?php function get_id(){ return $_GET['id']; } "
+                "$id = get_id(); echo $id;",
+                "$_GET",
+            ),
+            ("<?php $data = $_POST; echo $data['name'];", "$_POST"),
+        )
+        for source, expected_source in examples:
+            with self.subTest(expected_source=expected_source, source=source):
+                result = analyze_program(
+                    parse_php(source, "source-fixture.php"),
+                    sinks=(TaintSink("echo", "html"),),
+                )
+                self.assertTrue(result.complete, result.diagnostics)
+                self.assertEqual(len(result.flows), 1)
+                self.assertEqual(result.flows[0].source.name, expected_source)
 
     def test_tracks_source_through_assignments_calls_and_sink(self) -> None:
         result = self.analyze(

@@ -24,4 +24,4 @@ Plugin-scan results are written to `reports/<slug>/report_patchstack.md` and `re
 
 Example V5 Markdown trace: `line 3 $_GET -> line 3 $id -> line 3 echo`. Confidence describes the analyzer's evidence, not confirmed exploitability. Sanitizer/auth evidence and downgraded or incomplete cases are listed in the report's `v5_audit` section.
 
-See [MANUAL.md](MANUAL.md) for a quick start and [BOOK.md](BOOK.md) for the full guide. GitHub Actions runs tests and compilation only; it does not scan plugin targets.
+See [GUIDE.md](GUIDE.md) for the A–Z beginner guide for Windows 10, [MANUAL.md](MANUAL.md) for a quick start, and [BOOK.md](BOOK.md) for the full project guide and 25-plugin benchmark. GitHub Actions runs tests and compilation only; it does not scan plugin targets.

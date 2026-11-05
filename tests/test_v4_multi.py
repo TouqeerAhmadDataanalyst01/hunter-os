@@ -98,6 +98,141 @@ class ExistingWordPressFilterTests(unittest.TestCase):
 
 
 class TaintScannerModeTests(unittest.TestCase):
+    def test_real_file_wordpress_entrypoints_cover_ajax_shortcode_and_rest(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            source = root / "framework.php"
+            source.write_text(
+                "<?php\n"
+                "add_action('wp_ajax_nopriv_delete', 'delete_post');\n"
+                "function delete_post(){ wp_delete_post($_GET['id']); }\n"
+                "add_action('wp_ajax_remove', 'guarded_delete');\n"
+                "function guarded_delete(){ "
+                "if (!current_user_can('delete_posts')) { return; } "
+                "wp_delete_post($_GET['id']); }\n"
+                "add_action('wp_ajax_nopriv_nonce', 'nonce_delete');\n"
+                "function nonce_delete(){ "
+                "check_ajax_referer('delete'); wp_delete_post($_GET['id']); }\n"
+                "add_shortcode('public_value', 'shortcode_value');\n"
+                "function shortcode_value(){ echo $_GET['value']; }\n"
+                "register_rest_route('demo/v1', '/missing', ["
+                "'methods' => 'GET', 'callback' => 'rest_missing']);\n"
+                "function rest_missing(){ $id = $_GET['id']; wp_delete_post($id); }\n"
+                "register_rest_route('demo/v1', '/open', ["
+                "'methods' => 'GET', 'callback' => 'rest_open', "
+                "'permission_callback' => '__return_true']);\n"
+                "function rest_open(){ $id = $_GET['id']; wp_delete_post($id); }\n"
+                "register_rest_route('demo/v1', '/protected', ["
+                "'methods' => 'GET', 'callback' => 'rest_protected', "
+                "'permission_callback' => 'can_delete']);\n"
+                "function can_delete(){ return current_user_can('delete_posts'); }\n"
+                "function rest_protected(){ $id = $_GET['id']; wp_delete_post($id); }\n",
+                encoding="utf-8",
+            )
+
+            completed = subprocess.run(
+                [
+                    sys.executable,
+                    str(Path(__file__).resolve().parents[1] / "main.py"),
+                    "--engine=taint",
+                    str(source),
+                ],
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+
+            self.assertEqual(completed.returncode, 1, completed.stderr)
+            report = json.loads(completed.stdout)
+            self.assertEqual(report["findings"], [])
+            active = report["v5_taint_findings"]
+            audit = report["v5_audit"]
+            ajax = [
+                item for item in active
+                if item["type"] == "Unauthenticated WordPress AJAX Action"
+            ]
+            self.assertEqual(
+                {item["function"] for item in ajax},
+                {"delete_post", "nonce_delete"},
+            )
+            nonce = next(item for item in ajax if item["function"] == "nonce_delete")
+            self.assertIn("nonce is not auth", nonce["note"])
+            guarded = [
+                item for item in audit
+                if item["finding"].get("function") == "guarded_delete"
+                and item["finding"].get("type")
+                == "Unauthenticated WordPress AJAX Action"
+            ]
+            self.assertEqual(len(guarded), 1)
+
+            xss = [
+                item for item in active
+                if item["type"] == "Cross-Site Scripting (XSS)"
+            ]
+            shortcode_xss = next(
+                item for item in xss if item.get("function") == "shortcode_value"
+            )
+            self.assertTrue(
+                any(entry["type"] == "shortcode" for entry in shortcode_xss["entry_points"])
+            )
+
+            rest_findings = [
+                item for item in active
+                if item["type"] == "WordPress REST Route Authorization"
+            ]
+            self.assertEqual(
+                {item["entry_point"]["route"] for item in rest_findings},
+                {"/missing", "/open"},
+            )
+            self.assertTrue(
+                all("tainted" in item["note"].casefold() for item in rest_findings)
+            )
+            protected_action = [
+                item for item in audit
+                if item["finding"].get("function") == "rest_protected"
+                and item["finding"].get("type")
+                == "Sensitive State-Changing Action"
+            ]
+            self.assertEqual(len(protected_action), 1)
+            self.assertTrue(protected_action[0]["finding"]["auth_evidence"])
+
+    def test_rest_permission_proof_does_not_cover_same_callback_open_route(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            source = root / "shared_callback.php"
+            source.write_text(
+                "<?php\n"
+                "register_rest_route('demo/v1', '/protected', ["
+                "'callback' => 'shared_delete', 'permission_callback' => 'can_delete']);\n"
+                "register_rest_route('demo/v1', '/open', ["
+                "'callback' => 'shared_delete', 'permission_callback' => '__return_true']);\n"
+                "function can_delete(){ return current_user_can('delete_posts'); }\n"
+                "function shared_delete(){ wp_delete_post($_GET['id']); }\n",
+                encoding="utf-8",
+            )
+
+            completed = subprocess.run(
+                [
+                    sys.executable,
+                    str(Path(__file__).resolve().parents[1] / "main.py"),
+                    "--engine=taint",
+                    str(source),
+                ],
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+
+            self.assertEqual(completed.returncode, 1, completed.stderr)
+            report = json.loads(completed.stdout)
+            routes = [
+                item for item in report["v5_taint_findings"]
+                if item["type"] == "WordPress REST Route Authorization"
+            ]
+            self.assertEqual(
+                {item["entry_point"]["route"] for item in routes}, {"/open"}
+            )
+
     def test_real_file_cli_reports_only_unsanitized_xss(self) -> None:
         with tempfile.TemporaryDirectory() as temporary_directory:
             root = Path(temporary_directory)

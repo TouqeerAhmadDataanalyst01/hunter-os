@@ -40,10 +40,11 @@
 
 - [ ] M5: Framework analysis: WordPress hooks/actions, Laravel, Django, Node - identify entry points, routes, controllers
   - **Goal:** Add adapters for framework-specific entry points, routes/controllers, source/sink/sanitizer/authorization definitions, and only claim tested support.
-  - **Files to touch:** `analyzer/frameworks/` (new), framework fixtures/tests, `analyzer/platform.py`, `main.py`, docs.
-  - **Tests to add:** Per-framework detection, route/hook recognition, authorization, sanitization, cross-function flow, malformed input, and unsupported-framework regressions.
-  - **Done criteria:** A framework is marked supported only when its parser/analysis route and security checks are implemented and tested.
-  - **Risks:** Framework conventions vary by version and project structure; marker detection alone is insufficient support.
+  - **Implemented in this slice:** `analyzer/frameworks/wordpress.py` recognizes tested literal WordPress AJAX hooks, shortcode callbacks, and REST route callbacks. V4 mode is unchanged. Laravel, Django, and Node.js are still detected from markers only and receive no source-analysis claim.
+  - **Files touched:** `analyzer/frameworks/__init__.py`, `analyzer/frameworks/wordpress.py`, `analyzer/taint.py`, `analyzer/wordpress.py`, `tests/test_v4_multi.py`, `BOOK.md`, `README.md`.
+  - **Tests added:** Real-file CLI regression for `wp_ajax_nopriv_*`, privileged `wp_ajax_*` with capability proof, nonce-only AJAX handling, shortcode-to-XSS entry-point linking, REST routes with missing/`__return_true` permission callbacks, and a direct capability-check permission callback.
+  - **Remaining for M5 completion:** Laravel route/controller analysis, Django URL/view analysis, Node.js/Express route/controller analysis, and their source/sink/auth tests.
+  - **Risks:** WordPress dynamic callbacks, closures, callback arrays, complex permission functions, and cross-file registration/handlers are not resolved. Marker detection alone is insufficient support for the other frameworks.
 
 ## M6: Report V5
 

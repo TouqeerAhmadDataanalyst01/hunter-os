@@ -2,9 +2,9 @@
 
 Hunter OS is an offline source-review tool. It can identify WordPress, Laravel, Django, and Node.js project markers. **Only WordPress PHP analysis is implemented**; the other platforms are identified but skipped without a security scan.
 
-Use `--engine=regex` (the default) for V4 behavior, or `--engine=taint` to run the unchanged V4 checks alongside bounded PHP taint and WordPress-specific checks. The opt-in engine detects tainted data reaching HTML output, SQL, shell, file, upload, and outbound-request sinks; recognizes public `wp_ajax_nopriv_*` callbacks reaching selected sensitive operations; and reports selected high-confidence hardcoded credential patterns. These are potential findings requiring review, not confirmed vulnerabilities.
+Use `--engine=regex` (the default) for V4 behavior, or `--engine=taint` to run the unchanged V4 checks alongside bounded PHP taint and WordPress-specific checks. The opt-in engine detects tainted data reaching HTML output, SQL, shell, file, upload, and outbound-request sinks; analyzes literal WordPress AJAX hooks, shortcode callbacks, and REST route callbacks; and reports selected high-confidence hardcoded credential patterns. These are potential findings requiring review, not confirmed vulnerabilities.
 
-The parser remains an explicitly bounded PHP subset, not a complete PHP AST. In addition to plugin targets, taint mode accepts one real PHP file path directly and prints JSON to stdout. Sanitized or same-function authorization-guarded findings are retained in `v5_audit`; only active findings appear in `v5_taint_findings`. No scanned PHP is executed.
+The parser remains an explicitly bounded PHP subset, not a complete PHP AST. Laravel, Django, and Node.js project markers can be identified, but their routes and handlers are not analyzed. In addition to plugin targets, taint mode accepts one real PHP file path directly and prints JSON to stdout. Sanitized or same-function authorization-guarded findings are retained in `v5_audit`; only active findings appear in `v5_taint_findings`. No scanned PHP is executed.
 
 Use Python 3.10 or newer. No packages or API keys are needed. Source must already exist in `targets/plugins/<slug>/` or `targets/archives/<slug>.zip`; the program never downloads targets or contacts vulnerability databases.
 

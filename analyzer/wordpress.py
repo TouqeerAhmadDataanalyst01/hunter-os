@@ -22,6 +22,11 @@ from analyzer.php_parser import (
     parse_php_file,
 )
 from analyzer.detectors import detect_hardcoded_secrets
+from analyzer.frameworks.wordpress import (
+    WordPressEntryPoint,
+    discover_wordpress_entrypoints,
+    resolve_entrypoint_callbacks,
+)
 from analyzer.taint import (
     DEFAULT_SANITIZERS,
     TaintAnalysisResult,
@@ -361,23 +366,25 @@ def _guard_evidence_in_scope(
 
 
 def _auth_evidence_for_flow(
-    program: Program, flow: TaintFlow, relative_file: str
+    program: Program,
+    flow: TaintFlow,
+    relative_file: str,
+    framework_auth: dict[int, list[dict[str, object]]] | None = None,
 ) -> list[dict[str, object]]:
-    scopes: list[tuple[str, tuple[Statement, ...]]] = [
-        ("<top-level>", tuple(program.statements))
+    scopes: list[
+        tuple[str, tuple[Statement, ...], FunctionDef | None]
+    ] = [
+        ("<top-level>", tuple(program.statements), None)
     ]
     functions: list[FunctionDef] = list(program.functions)
     for class_def in program.classes:
         functions.extend(class_def.methods)
     for function in functions:
-        scope_name = (
-            f"{function.class_name}::{function.name}"
-            if function.class_name
-            else function.name
+        scopes.append(
+            (_callback_scope_name(function), tuple(function.body), function)
         )
-        scopes.append((scope_name, tuple(function.body)))
 
-    for scope_name, statements in scopes:
+    for scope_name, statements, function in scopes:
         calls = _scope_calls(statements)
         sink_in_scope = any(
             call.location.file == flow.sink.location.file
@@ -386,9 +393,13 @@ def _auth_evidence_for_flow(
         )
         if not sink_in_scope:
             continue
-        return _guard_evidence_in_scope(
+        evidence = _guard_evidence_in_scope(
             statements, flow.sink.location, scope_name, relative_file
         )
+        if evidence:
+            return evidence
+        if function is not None and framework_auth is not None:
+            return framework_auth.get(id(function), [])
     return []
 
 
@@ -464,6 +475,7 @@ def _finding_from_flow(
         "file_path": "Directory Traversal / Local File Inclusion",
         "command": "Command Injection",
         "network_url": "Server-Side Request Forgery",
+        "sensitive_action": "Sensitive State-Changing Action",
     }
     finding: dict[str, object] = {
         "file": relative_file,
@@ -543,13 +555,6 @@ _AJAX_SENSITIVE_CALLS = {
 }
 
 
-def _literal_string(value: str) -> str | None:
-    value = value.strip()
-    if len(value) < 2 or value[0] not in {"'", '"'} or value[-1] != value[0]:
-        return None
-    return value[1:-1]
-
-
 def _program_functions(program: Program) -> list[FunctionDef]:
     functions = list(program.functions)
     for class_def in program.classes:
@@ -557,122 +562,317 @@ def _program_functions(program: Program) -> list[FunctionDef]:
     return functions
 
 
-def _ajax_findings(program: Program, relative_file: str) -> list[dict[str, object]]:
-    all_statements: list[tuple[str, tuple[Statement, ...]]] = [
-        ("<top-level>", tuple(program.statements))
-    ]
-    all_statements.extend(
-        (function.name, tuple(function.body))
-        for function in _program_functions(program)
-    )
-    calls = [
-        call
-        for _, statements in all_statements
-        for call in _scope_calls(statements)
-    ]
-    functions_by_name: dict[str, list[FunctionDef]] = {}
-    for function in _program_functions(program):
-        functions_by_name.setdefault(function.name.casefold(), []).append(function)
+def _entry_point_record(entry_point: WordPressEntryPoint) -> dict[str, object]:
+    record: dict[str, object] = {
+        "type": entry_point.kind,
+        "name": entry_point.name,
+        "callback": entry_point.callback,
+        "line": entry_point.location.line,
+    }
+    if entry_point.route is not None:
+        record["route"] = entry_point.route
+    if entry_point.permission_callback is not None:
+        record["permission_callback"] = entry_point.permission_callback
+    return record
 
-    findings: list[dict[str, object]] = []
-    for registration in calls:
-        if registration.name.casefold() not in {"add_action", "add_filter"}:
-            continue
-        if len(registration.arguments) < 2:
-            continue
-        hook = _literal_string(registration.arguments[0])
-        callback = _literal_string(registration.arguments[1])
-        if hook is None or callback is None or not hook.casefold().startswith("wp_ajax_nopriv_"):
-            continue
-        targets = functions_by_name.get(callback.casefold(), [])
-        if len(targets) != 1:
-            continue
-        function = targets[0]
-        sensitive_call = next(
-            (
-                call
-                for call in _scope_calls(tuple(function.body))
-                if call.name.rsplit("->", 1)[-1].rsplit("::", 1)[-1].casefold()
-                in _AJAX_SENSITIVE_CALLS
-                or call.name.casefold()
-                in {"$wpdb->query", "$wpdb->get_results", "$wpdb->get_row", "$wpdb->get_var"}
-            ),
-            None,
+
+def _callback_scope_name(function: FunctionDef) -> str:
+    return (
+        f"{function.class_name}::{function.name}"
+        if function.class_name
+        else function.name
+    )
+
+
+def _permission_callback_proof(
+    permission_callback: str,
+    functions: list[FunctionDef],
+    relative_file: str,
+) -> list[dict[str, object]]:
+    if permission_callback.casefold() == "__return_true":
+        return []
+    candidates = [
+        function
+        for function in functions
+        if function.name.casefold() == permission_callback.casefold()
+        or (
+            function.class_name
+            and f"{function.class_name}::{function.name}".casefold()
+            == permission_callback.casefold()
         )
-        if sensitive_call is None:
+    ]
+    if len(candidates) != 1:
+        return []
+    function = candidates[0]
+    evidence: list[dict[str, object]] = []
+    for statement in _walk_statements(tuple(function.body)):
+        if not isinstance(statement, ReturnStatement) or statement.value is None:
             continue
-        scope_name = (
-            f"{function.class_name}::{function.name}"
-            if function.class_name
-            else function.name
-        )
-        auth_evidence = _guard_evidence_in_scope(
-            tuple(function.body),
-            sensitive_call.location,
-            scope_name,
-            relative_file,
-        )
-        nonce_evidence = [
-            {
-                "name": call.name,
-                "file": relative_file,
-                "line": call.location.line,
-                "note": "nonce verification is not authorization proof",
-            }
-            for call in _scope_calls(tuple(function.body))
-            if call.name.rsplit("->", 1)[-1].rsplit("::", 1)[-1].casefold()
-            in {"check_ajax_referer", "wp_verify_nonce"}
-        ]
-        line = sensitive_call.location.line
-        findings.append(
-            {
-                "file": relative_file,
-                "line": line,
-                "type": "Unauthenticated WordPress AJAX Action",
-                "status": "POTENTIAL",
-                "confidence": "medium",
-                "context": "ajax_authorization",
-                "function": scope_name,
-                "source": {
-                    "name": hook,
+        expression = statement.value
+        if (
+            len(expression.calls) == 1
+            and expression.text.strip().casefold().startswith(
+                expression.calls[0].name.casefold()
+            )
+            and expression.calls[0].name.rsplit("->", 1)[-1].rsplit("::", 1)[-1].casefold()
+            in {"current_user_can", "user_can"}
+        ):
+            call = expression.calls[0]
+            evidence.append(
+                {
+                    "name": call.name,
                     "file": relative_file,
-                    "line": registration.location.line,
-                },
-                "sink": {
-                    "name": sensitive_call.name,
+                    "line": call.location.line,
+                    "scope": _callback_scope_name(function),
+                    "proof": "permission callback directly returns a capability check",
+                }
+            )
+    return evidence
+
+
+def _framework_authorization_evidence(
+    entry_points: list[WordPressEntryPoint],
+    functions: list[FunctionDef],
+    relative_file: str,
+) -> dict[int, list[dict[str, object]]]:
+    grouped: dict[int, tuple[FunctionDef, list[WordPressEntryPoint]]] = {}
+    for entry_point, function in resolve_entrypoint_callbacks(entry_points, functions):
+        grouped.setdefault(id(function), (function, []))[1].append(entry_point)
+
+    evidence_by_function: dict[int, list[dict[str, object]]] = {}
+    for function_id, (function, registrations) in grouped.items():
+        if not registrations or any(
+            registration.kind != "rest" for registration in registrations
+        ):
+            continue
+        proofs = [
+            _permission_callback_proof(
+                registration.permission_callback, functions, relative_file
+            )
+            if registration.permission_callback is not None
+            else []
+            for registration in registrations
+        ]
+        if all(proofs):
+            evidence_by_function[function_id] = [
+                item for proof in proofs for item in proof
+            ]
+    return evidence_by_function
+
+
+def _wordpress_framework_findings(
+    program: Program,
+    relative_file: str,
+    flows: list[TaintFlow],
+    entry_points: list[WordPressEntryPoint] | None = None,
+    framework_auth: dict[int, list[dict[str, object]]] | None = None,
+) -> list[dict[str, object]]:
+    findings: list[dict[str, object]] = []
+    functions = _program_functions(program)
+    if entry_points is None:
+        entry_points = discover_wordpress_entrypoints(program)
+    resolved = resolve_entrypoint_callbacks(entry_points, functions)
+
+    for entry_point, function in resolved:
+        if entry_point.kind == "shortcode":
+            continue
+        scope_name = _callback_scope_name(function)
+        function_body = tuple(function.body)
+        function_calls = _scope_calls(function_body)
+        if entry_point.kind == "ajax":
+            hook = entry_point.name
+            sensitive_call = next(
+                (
+                    call
+                    for call in function_calls
+                    if call.name.rsplit("->", 1)[-1]
+                    .rsplit("::", 1)[-1]
+                    .casefold()
+                    in _AJAX_SENSITIVE_CALLS
+                    or call.name.casefold()
+                    in {
+                        "$wpdb->query",
+                        "$wpdb->get_results",
+                        "$wpdb->get_row",
+                        "$wpdb->get_var",
+                    }
+                ),
+                None,
+            )
+            if sensitive_call is None:
+                continue
+            auth_evidence = _guard_evidence_in_scope(
+                function_body,
+                sensitive_call.location,
+                scope_name,
+                relative_file,
+            )
+            nonce_evidence = [
+                {
+                    "name": call.name,
+                    "file": relative_file,
+                    "line": call.location.line,
+                    "note": "nonce is not auth",
+                }
+                for call in function_calls
+                if call.name.rsplit("->", 1)[-1].rsplit("::", 1)[-1].casefold()
+                in {"check_ajax_referer", "wp_verify_nonce", "check_admin_referer"}
+            ]
+            nonce_note = (
+                " Nonce verification is not authorization proof; nonce is not auth."
+                if nonce_evidence and not auth_evidence
+                else ""
+            )
+            line = sensitive_call.location.line
+            findings.append(
+                {
                     "file": relative_file,
                     "line": line,
-                },
-                "trace": [
-                    {
-                        "kind": "hook",
+                    "type": "Unauthenticated WordPress AJAX Action",
+                    "status": "POTENTIAL",
+                    "confidence": "medium",
+                    "context": "ajax_authorization",
+                    "function": scope_name,
+                    "source": {
                         "name": hook,
                         "file": relative_file,
-                        "line": registration.location.line,
+                        "line": entry_point.location.line,
                     },
-                    {
-                        "kind": "callback",
-                        "name": scope_name,
-                        "file": relative_file,
-                        "line": function.location.line,
-                    },
-                    {
-                        "kind": "sensitive_operation",
+                    "sink": {
                         "name": sensitive_call.name,
                         "file": relative_file,
                         "line": line,
                     },
-                ],
+                    "trace": [
+                        {
+                            "kind": "hook",
+                            "name": hook,
+                            "file": relative_file,
+                            "line": entry_point.location.line,
+                        },
+                        {
+                            "kind": "callback",
+                            "name": scope_name,
+                            "file": relative_file,
+                            "line": function.location.line,
+                        },
+                        {
+                            "kind": "sensitive_operation",
+                            "name": sensitive_call.name,
+                            "file": relative_file,
+                            "line": line,
+                        },
+                    ],
+                    "sanitizer_evidence": [],
+                    "auth_evidence": auth_evidence,
+                    "nonce_evidence": nonce_evidence,
+                    "entry_points": [_entry_point_record(entry_point)],
+                    "note": (
+                        f"WordPress AJAX callback {hook} reaches a sensitive operation."
+                        f"{nonce_note}"
+                    ),
+                }
+            )
+            continue
+
+        route_flows = [
+            flow
+            for flow in flows
+            if any(
+                call.location.file == flow.sink.location.file
+                and call.location.offset == flow.sink.location.offset
+                for call in function_calls
+            )
+        ]
+        if not route_flows:
+            continue
+        permission_callback = entry_point.permission_callback
+        permission_evidence = (
+            _permission_callback_proof(
+                permission_callback, functions, relative_file
+            )
+            if permission_callback is not None
+            else []
+        )
+        if permission_callback is not None and (
+            permission_callback.casefold() == "__return_true" or not permission_evidence
+        ):
+            permission_evidence = []
+        elif permission_evidence:
+            continue
+        flow = route_flows[0]
+        auth_evidence = _auth_evidence_for_flow(
+            program, flow, relative_file, framework_auth
+        )
+        if auth_evidence:
+            continue
+        sink_call = next(
+            call
+            for call in function_calls
+            if call.location.file == flow.sink.location.file
+            and call.location.offset == flow.sink.location.offset
+        )
+        line = sink_call.location.line
+        findings.append(
+            {
+                "file": relative_file,
+                "line": line,
+                "type": "WordPress REST Route Authorization",
+                "status": "POTENTIAL",
+                "confidence": "medium",
+                "context": "rest_authorization",
+                "function": scope_name,
+                "source": {
+                    "name": flow.source.name,
+                    "file": relative_file,
+                    "line": flow.source.location.line,
+                },
+                "sink": {
+                    "name": sink_call.name,
+                    "file": relative_file,
+                    "line": line,
+                },
+                "trace": _finding_from_flow(flow, [], relative_file, program)["trace"],
                 "sanitizer_evidence": [],
-                "auth_evidence": auth_evidence,
-                "nonce_evidence": nonce_evidence,
+                "auth_evidence": permission_evidence,
+                "entry_point": {
+                    **_entry_point_record(entry_point),
+                    "route": entry_point.route,
+                },
                 "note": (
-                    "Public wp_ajax_nopriv callback reaches a sensitive operation; "
-                    "nonce verification alone does not establish authorization."
+                    "Tainted data reaches a WordPress REST callback sink, but the "
+                    "route has no proven permission callback."
                 ),
             }
         )
     return findings
+
+
+def _annotate_entry_points(
+    program: Program,
+    findings: list[dict[str, object]],
+    relative_file: str,
+    entry_points: list[WordPressEntryPoint] | None = None,
+) -> None:
+    resolved = resolve_entrypoint_callbacks(
+        entry_points or discover_wordpress_entrypoints(program),
+        _program_functions(program),
+    )
+    records_by_callback: dict[str, list[dict[str, object]]] = {}
+    for entry_point, function in resolved:
+        records_by_callback.setdefault(function.name.casefold(), []).append(
+            _entry_point_record(entry_point)
+        )
+    for finding in findings:
+        if finding.get("file") != relative_file:
+            continue
+        function_name = finding.get("function")
+        if not isinstance(function_name, str):
+            continue
+        short_name = function_name.rsplit("::", 1)[-1].casefold()
+        entry_points = records_by_callback.get(short_name)
+        if entry_points:
+            finding["entry_points"] = entry_points
 
 
 def _judge_taint_findings(
@@ -776,6 +976,11 @@ def _analyze_taint_file(
             )
         )
     else:
+        entry_points = discover_wordpress_entrypoints(program)
+        functions = _program_functions(program)
+        framework_auth = _framework_authorization_evidence(
+            entry_points, functions, relative_file
+        )
         analysis: TaintAnalysisResult = analyze_program(program)
         if not analysis.complete:
             result.complete = False
@@ -803,12 +1008,25 @@ def _analyze_taint_file(
             result.findings.append(
                 _finding_from_flow(
                     flow,
-                    _auth_evidence_for_flow(program, flow, relative_file),
+                    _auth_evidence_for_flow(
+                        program, flow, relative_file, framework_auth
+                    ),
                     relative_file,
                     program,
                 )
             )
-        result.findings.extend(_ajax_findings(program, relative_file))
+        result.findings.extend(
+            _wordpress_framework_findings(
+                program,
+                relative_file,
+                analysis.flows,
+                entry_points,
+                framework_auth,
+            )
+        )
+        _annotate_entry_points(
+            program, result.findings, relative_file, entry_points
+        )
 
     try:
         if source_file.stat().st_size <= MAX_SOURCE_BYTES:

@@ -164,6 +164,14 @@ The `--engine=taint` path currently maps flows to these potential finding catego
 
 Downgraded taint and AJAX findings are not included in the active `v5_taint_findings` list, but remain visible with their evidence in `v5_audit`. V4 records are preserved independently in the `findings` field. The V5 finding list is not yet rendered in Markdown.
 
+### WordPress framework entry points (M5)
+
+`analyzer/frameworks/wordpress.py` recognizes literal, direct callbacks registered through `add_action()` for `wp_ajax_*` hooks, `add_shortcode()`, and `register_rest_route()`. Taint findings inside recognized callbacks include entry-point metadata. Dynamic callbacks, closures, callback arrays, inherited methods, and cross-file registration/handlers are not resolved.
+
+Both `wp_ajax_nopriv_*` and `wp_ajax_*` callbacks are reviewed when they reach selected sensitive operations. A recognized same-function capability guard downgrades but preserves the finding in `v5_audit`. Nonce checks are evidence only and the note explicitly states that a nonce is not authorization. For REST routes, missing or literal `__return_true` permission callbacks are reported when tainted data reaches a modeled sink in the route callback. A simple permission callback that directly returns `current_user_can()` or `user_can()` is recognized; more complex permission logic requires manual review and is not proven.
+
+WordPress shortcodes are linked to taint findings for their literal callback functions, including XSS findings. This entry-point metadata does not prove that the shortcode is registered or invoked on a reachable page. Laravel, Django, and Node.js are still marker-detected only; their routes and handlers are not analyzed or reported as supported.
+
 Each source file is limited to 2 MB. The current text heuristics look for:
 
 - **File upload input:** `$_FILES`.

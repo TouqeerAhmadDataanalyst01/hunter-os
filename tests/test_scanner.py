@@ -322,6 +322,39 @@ class ScannerTests(unittest.TestCase):
 class PhpParserTests(unittest.TestCase):
     FIXTURES = Path(__file__).parent / "fixtures" / "php"
 
+    def test_mixed_inline_html_and_short_echo_tags_are_parsed(self) -> None:
+        program = parse_php(
+            "<?php function render(){ ?>\n"
+            "<div>Static markup</div>\n"
+            "<?= esc_html($_GET['name']) ?>\n"
+            "<?php }",
+            "mixed-template.php",
+        )
+
+        self.assertTrue(program.complete, program.diagnostics)
+        statements = program.functions[0].body
+        self.assertEqual(len(statements), 3)
+        self.assertIsInstance(statements[0], OutputStatement)
+        self.assertEqual(statements[0].kind, "inline_html")
+        self.assertIsInstance(statements[1], OutputStatement)
+        self.assertEqual(statements[1].kind, "echo")
+        self.assertEqual(statements[1].expressions[0].calls[0].name, "esc_html")
+        self.assertEqual(statements[1].location.line, 3)
+        self.assertIsInstance(statements[2], OutputStatement)
+        self.assertEqual(statements[2].kind, "inline_html")
+
+    def test_class_qualified_static_property_assignment_is_parsed(self) -> None:
+        program = parse_php(
+            "<?php class Cache { public static $items = array(); "
+            "public function populate(){ Cache::$items = $_GET['item']; } }",
+            "static-property.php",
+        )
+
+        self.assertTrue(program.complete, program.diagnostics)
+        assignment = program.classes[0].methods[0].body[0]
+        self.assertEqual(assignment.target, "Cache::$items")
+        self.assertEqual(assignment.value.variables, ("$_GET",))
+
     def test_echo_and_print_output_statements_preserve_locations(self) -> None:
         program = parse_php(
             "<?php function output(){ echo $_GET['x'], esc_html($x); print($x); }",
@@ -385,10 +418,11 @@ class PhpParserTests(unittest.TestCase):
         self.assertFalse(malformed_expression.complete)
         self.assertFalse(unterminated_string.complete)
 
-    def test_inline_html_and_complex_interpolation_are_explicitly_incomplete(self) -> None:
+    def test_inline_html_is_output_and_interpolation_remains_supported(self) -> None:
         inline_html = parse_php("<p>HTML</p><?php $value = 1;")
-        self.assertFalse(inline_html.complete)
-        self.assertTrue(any(item.code == "inline_html" for item in inline_html.diagnostics))
+        self.assertTrue(inline_html.complete, inline_html.diagnostics)
+        self.assertIsInstance(inline_html.statements[0], OutputStatement)
+        self.assertEqual(inline_html.statements[0].kind, "inline_html")
 
         interpolated = parse_php('<?php $value = "$name";')
         self.assertTrue(interpolated.complete, interpolated.diagnostics)
@@ -543,6 +577,16 @@ class TaintAnalysisTests(unittest.TestCase):
                 self.assertEqual(len(result.flows), 1)
                 self.assertEqual(result.flows[0].source.name, source)
 
+    def test_short_echo_tag_is_an_html_output_sink(self) -> None:
+        result = analyze_program(
+            parse_php("<?= $_GET['value'] ?>", "short-echo.php"),
+            sinks=(TaintSink("echo", "html"),),
+        )
+
+        self.assertTrue(result.complete, result.diagnostics)
+        self.assertEqual(len(result.flows), 1)
+        self.assertEqual(result.flows[0].source.name, "$_GET")
+
     def test_contextual_sanitizers_are_recognized_without_overclaiming_input_filters(self) -> None:
         for sanitizer in (
             "esc_html",
@@ -599,6 +643,46 @@ class TaintAnalysisTests(unittest.TestCase):
         )
         self.assertEqual(len(safe.flows), 1)
         self.assertTrue(safe.flows[0].mitigated)
+
+    def test_wpdb_prepare_array_arguments_bind_all_placeholders(self) -> None:
+        result = analyze_program(
+            parse_php(
+                '<?php global $wpdb; $id = $_GET["id"]; $name = $_POST["name"]; '
+                '$sql = $wpdb->prepare('
+                '"SELECT * FROM users WHERE id=%d AND name=%s", array($id, $name)); '
+                '$wpdb->query($sql);',
+                "prepare-array-arguments.php",
+            )
+        )
+
+        self.assertEqual(len(result.flows), 2)
+        self.assertTrue(all(flow.mitigated for flow in result.flows))
+
+    def test_taint_tracks_class_qualified_static_property_assignments(self) -> None:
+        result = self.analyze(
+            "<?php $value = $_GET['value']; "
+            "Cache::$cached = $value; consume(Cache::$cached);"
+        )
+
+        self.assertTrue(result.complete, result.diagnostics)
+        self.assertEqual(len(result.flows), 1)
+        self.assertEqual(result.flows[0].source.name, "$_GET")
+
+    def test_apply_filters_only_propagates_its_filtered_value(self) -> None:
+        result = analyze_program(
+            parse_php(
+                '<?php global $wpdb; $id = $_GET["id"]; $extra = $_POST["extra"]; '
+                '$sql = $wpdb->prepare('
+                '"SELECT * FROM users WHERE id=%d", array($id)); '
+                '$filtered = apply_filters("query", $sql, $extra); '
+                '$wpdb->query($filtered);',
+                "filtered-query.php",
+            )
+        )
+
+        self.assertEqual(len(result.flows), 1)
+        self.assertEqual(result.flows[0].source.name, "$_GET")
+        self.assertTrue(result.flows[0].mitigated)
 
     def test_namespace_switch_foreach_and_dynamic_property_preserve_sql_taint(self) -> None:
         program = parse_php(

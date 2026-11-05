@@ -309,33 +309,24 @@ class _Lexer:
         leading_text = source[:first_opening] if first_opening >= 0 else ""
         has_php_tag = source.lstrip().startswith("<?") or leading_text.lstrip().startswith("<")
         in_php = not has_php_tag
+        short_echo = False
         cursor = 0
         tokens: list[_Token] = []
         while cursor < len(source):
             if not in_php:
                 opening = source.find("<?", cursor)
                 if opening < 0:
-                    if source[cursor:].strip():
-                        self._diagnose(
-                            "Inline HTML is outside the parsed PHP subset",
-                            cursor,
-                            "inline_html",
-                        )
+                    if cursor < len(source):
+                        tokens.append(_Token("inline_html", "", cursor, len(source)))
                     break
-                if source[cursor:opening].strip():
-                    self._diagnose(
-                        "Inline HTML is outside the parsed PHP subset",
-                        cursor,
-                        "inline_html",
-                    )
+                if cursor < opening:
+                    tokens.append(_Token("inline_html", "", cursor, opening))
                 if source[opening : opening + 5].lower() == "<?php":
+                    short_echo = False
                     cursor = opening + 5
                 elif source.startswith("<?=", opening):
-                    self._diagnose(
-                        "Short echo tags are not supported",
-                        opening,
-                        "unsupported_tag",
-                    )
+                    tokens.append(_Token("identifier", "echo", opening, opening + 3))
+                    short_echo = True
                     cursor = opening + 3
                 else:
                     self._diagnose(
@@ -348,6 +339,9 @@ class _Lexer:
                 continue
 
             if source.startswith("?>", cursor):
+                if short_echo:
+                    tokens.append(_Token("symbol", ";", cursor, cursor + 2))
+                    short_echo = False
                 cursor += 2
                 in_php = False
                 continue
@@ -818,6 +812,15 @@ class _Parser:
         token = self._peek()
         if token is None:
             return None
+        if token.kind == "inline_html":
+            self._take()
+            text = self.source[token.start : token.end]
+            location = self.location(token.start)
+            return OutputStatement(
+                "inline_html",
+                (Expression(text, (), (), location),),
+                location,
+            )
         keyword = token.value.lower() if token.kind == "identifier" else ""
         if keyword == "if":
             return self._parse_if()
@@ -1116,7 +1119,18 @@ class _Parser:
         if assignment_index is not None:
             target_tokens = expression_tokens[:assignment_index]
             value_tokens = expression_tokens[assignment_index + 1 :]
-            if not target_tokens or target_tokens[0].kind != "variable":
+            is_variable_target = (
+                bool(target_tokens) and target_tokens[0].kind == "variable"
+            )
+            is_static_property_target = bool(
+                target_tokens
+                and re.fullmatch(
+                    r"\\?[A-Za-z_][A-Za-z0-9_]*(?:\\[A-Za-z_][A-Za-z0-9_]*)*"
+                    r"::\$[A-Za-z_][A-Za-z0-9_]*(?:\[[^\]]+\])*",
+                    self._text(target_tokens),
+                )
+            )
+            if not is_variable_target and not is_static_property_target:
                 self._diagnose("Assignment has no variable target", start, "parser_error")
                 return None
             if not value_tokens:
@@ -1217,6 +1231,27 @@ class _Parser:
         variables: list[tuple[str, SourceLocation]] = []
         for index, token in enumerate(tokens):
             if token.kind == "variable":
+                if (
+                    index >= 2
+                    and tokens[index - 1].value == "::"
+                    and tokens[index - 2].kind == "identifier"
+                ):
+                    class_start = index - 2
+                    while (
+                        class_start >= 2
+                        and tokens[class_start - 1].value == "\\"
+                        and tokens[class_start - 2].kind == "identifier"
+                    ):
+                        class_start -= 2
+                    if class_start > 0 and tokens[class_start - 1].value == "\\":
+                        class_start -= 1
+                    variables.append(
+                        (
+                            self._text(tokens[class_start : index + 1]),
+                            self.location(token.start),
+                        )
+                    )
+                    continue
                 if (
                     token.value.casefold() == "$_server"
                     and index + 3 < len(tokens)

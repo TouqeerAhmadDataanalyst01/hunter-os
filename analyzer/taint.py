@@ -22,9 +22,11 @@ from analyzer.php_parser import (
 
 
 _TARGET_PATTERN = re.compile(
-    r"(\$[A-Za-z_][A-Za-z0-9_]*)"
+    r"(?P<variable>\$[A-Za-z_][A-Za-z0-9_]*)"
     r"(?:\s*(?:\[[^\]]*\]|\?->\s*(?:\{[^}]*\}|[A-Za-z_][A-Za-z0-9_]*)"
     r"|->\s*(?:\{[^}]*\}|[A-Za-z_][A-Za-z0-9_]*)))*"
+    r"|(?P<static>\\?[A-Za-z_][A-Za-z0-9_]*(?:\\[A-Za-z_][A-Za-z0-9_]*)*"
+    r"::\$[A-Za-z_][A-Za-z0-9_]*)(?:\s*\[[^\]]*\])*"
 )
 
 
@@ -238,7 +240,20 @@ def _sanitizer_is_effective(sanitizer: SanitizerSpec, call: Call) -> bool:
     placeholders = re.findall(
         r"(?<!%)%(?:\d+\$)?[sdfi]", call.arguments[0], re.IGNORECASE
     )
-    return bool(placeholders) and len(placeholders) <= len(call.arguments) - 1
+    bound_arguments = len(call.arguments) - 1
+    array_argument = call.arguments[1].lstrip().casefold().startswith("array(")
+    if array_argument and len(call.argument_calls) > 1:
+        array_call = next(
+            (
+                nested
+                for nested in call.argument_calls[1]
+                if nested.name.casefold() == "array"
+            ),
+            None,
+        )
+        if array_call is not None:
+            bound_arguments = len(array_call.arguments)
+    return bool(placeholders) and len(placeholders) <= bound_arguments
 
 
 class _Analyzer:
@@ -524,6 +539,22 @@ class _Analyzer:
         if source_values:
             return source_values
 
+        if _call_matches(call.name, "apply_filters") and len(arguments) > 1:
+            filtered_values = arguments[1]
+            propagation_step = self._step("propagator", "apply_filters", call.location)
+            return self._bounded_values(
+                {
+                    _TaintedValue(
+                        value.source,
+                        value.trace + (propagation_step,),
+                        value.sanitizers,
+                        value.sanitized_contexts,
+                    )
+                    for value in filtered_values
+                },
+                call.location,
+            )
+
         sanitizer = next(
             (
                 item
@@ -722,7 +753,8 @@ class _Analyzer:
                         statement.location,
                     )
                     continue
-                target = target_match.group(1)
+                target = target_match.group("variable") or target_match.group("static")
+                assert target is not None
                 if statement.operator != "=":
                     values.update(current.get(target, set()))
                 elif "[" in statement.target or "->" in statement.target:

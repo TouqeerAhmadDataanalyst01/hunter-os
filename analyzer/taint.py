@@ -9,6 +9,7 @@ from analyzer.php_parser import (
     Assignment,
     Call,
     CallStatement,
+    ControlStatement,
     Expression,
     FunctionDef,
     IfStatement,
@@ -20,7 +21,11 @@ from analyzer.php_parser import (
 )
 
 
-_TARGET_PATTERN = re.compile(r"(\$[A-Za-z_][A-Za-z0-9_]*)")
+_TARGET_PATTERN = re.compile(
+    r"(\$[A-Za-z_][A-Za-z0-9_]*)"
+    r"(?:\s*(?:\[[^\]]*\]|\?->\s*(?:\{[^}]*\}|[A-Za-z_][A-Za-z0-9_]*)"
+    r"|->\s*(?:\{[^}]*\}|[A-Za-z_][A-Za-z0-9_]*)))*"
+)
 
 
 @dataclass(frozen=True)
@@ -213,13 +218,14 @@ class _Execution:
 
 
 def _call_matches(call_name: str, registered_name: str) -> bool:
-    call_name = call_name.casefold()
+    call_name = call_name.casefold().lstrip("\\")
     registered_name = registered_name.casefold()
-    if call_name == registered_name:
+    unqualified_name = call_name.rsplit("\\", 1)[-1]
+    if call_name == registered_name or unqualified_name == registered_name:
         return True
     if registered_name.startswith("$") or "::" in registered_name or "->" in registered_name:
         return False
-    return call_name.endswith(f"->{registered_name}") or call_name.endswith(
+    return call_name.endswith(f"->{registered_name}") or unqualified_name.endswith(
         f"::{registered_name}"
     )
 
@@ -385,7 +391,11 @@ class _Analyzer:
         return sources
 
     def _function_for_call(self, call_name: str) -> FunctionDef | None:
-        exact = self.functions.get(call_name.casefold(), [])
+        normalized = call_name.lstrip("\\").casefold()
+        if "::" in normalized:
+            class_name, method_name = normalized.rsplit("::", 1)
+            normalized = class_name.rsplit("\\", 1)[-1] + "::" + method_name
+        exact = self.functions.get(normalized, [])
         if len(exact) == 1:
             return exact[0]
         if len(exact) > 1:
@@ -715,6 +725,8 @@ class _Analyzer:
                 target = target_match.group(1)
                 if statement.operator != "=":
                     values.update(current.get(target, set()))
+                elif "[" in statement.target or "->" in statement.target:
+                    values.update(current.get(target, set()))
                 current[target] = self._bounded_values(
                     {
                         _TaintedValue(
@@ -766,6 +778,101 @@ class _Analyzer:
                 ]
                 current = self._merge_environments(active_environments)
                 active = bool(active_environments)
+            elif isinstance(statement, ControlStatement):
+                if statement.kind in {"break", "continue"}:
+                    active = False
+                elif statement.kind == "throw":
+                    if statement.expression is not None:
+                        self._evaluate_expression(statement.expression, current, depth)
+                    active = False
+                elif statement.kind == "switch":
+                    if statement.expression is not None:
+                        self._evaluate_expression(statement.expression, current, depth)
+                    branch_results = [
+                        self._execute(body, current, depth)
+                        for _, body in statement.branches
+                    ]
+                    if not any(label is None for label, _ in statement.branches):
+                        branch_results.append(
+                            _Execution(
+                                {name: set(values) for name, values in current.items()}
+                            )
+                        )
+                    returns = self._bounded_values(
+                        returns
+                        | set().union(*(item.returns for item in branch_results)),
+                        statement.location,
+                    )
+                    current = self._merge_environments(
+                        [item.environment for item in branch_results]
+                    )
+                    active = True
+                elif statement.kind == "try":
+                    alternatives = [
+                        self._execute(statement.body, current, depth)
+                    ]
+                    finally_body: tuple[Statement, ...] = ()
+                    for condition, body in statement.branches:
+                        if condition is None:
+                            finally_body = body
+                        else:
+                            self._evaluate_expression(condition, current, depth)
+                            alternatives.append(self._execute(body, current, depth))
+                    returns = self._bounded_values(
+                        returns | set().union(*(item.returns for item in alternatives)),
+                        statement.location,
+                    )
+                    current = self._merge_environments(
+                        [item.environment for item in alternatives if item.active]
+                    )
+                    active = any(item.active for item in alternatives)
+                    if finally_body and active:
+                        final_result = self._execute(finally_body, current, depth)
+                        returns = self._bounded_values(
+                            returns | final_result.returns, statement.location
+                        )
+                        current = final_result.environment
+                        active = final_result.active
+                else:
+                    iterable_values: set[_TaintedValue] = set()
+                    if statement.expression is not None:
+                        iterable_values = self._evaluate_expression(
+                            statement.expression, current, depth
+                        )
+                    loop_environment = {
+                        name: set(values) for name, values in current.items()
+                    }
+                    for variable in statement.iteration_variables:
+                        loop_environment[variable] = self._bounded_values(
+                            {
+                                _TaintedValue(
+                                    value.source,
+                                    value.trace
+                                    + (
+                                        self._step(
+                                            "assignment",
+                                            variable,
+                                            statement.location,
+                                        ),
+                                    ),
+                                    value.sanitizers,
+                                    value.sanitized_contexts,
+                                )
+                                for value in iterable_values
+                            },
+                            statement.location,
+                        )
+                    loop_result = self._execute(
+                        statement.body, loop_environment, depth
+                    )
+                    returns = self._bounded_values(
+                        returns | loop_result.returns, statement.location
+                    )
+                    environments = [loop_result.environment]
+                    if statement.kind != "do_while":
+                        environments.append(current)
+                    current = self._merge_environments(environments)
+                    active = True
         return _Execution(current, returns, active)
 
 

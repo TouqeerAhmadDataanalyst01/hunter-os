@@ -370,16 +370,17 @@ class PhpParserTests(unittest.TestCase):
     def test_malformed_and_unsupported_fixtures_never_claim_complete_parse(self) -> None:
         malformed = parse_php_file(self.FIXTURES / "malformed.php")
         unsupported = parse_php_file(self.FIXTURES / "unsupported.php")
+        unsupported_control = parse_php("<?php goto destination;")
         malformed_assignment = parse_php("<?php $value = ;")
         malformed_expression = parse_php("<?php $value = $other + ;")
         unterminated_string = parse_php("<?php $value = 'unfinished;")
 
         self.assertFalse(malformed.complete)
         self.assertTrue(any(item.code == "parser_error" for item in malformed.diagnostics))
-        self.assertFalse(unsupported.complete)
-        self.assertTrue(
-            any("foreach" in item.message for item in unsupported.diagnostics)
-        )
+        self.assertTrue(unsupported.complete, unsupported.diagnostics)
+        self.assertTrue(unsupported.functions[0].body)
+        self.assertFalse(unsupported_control.complete)
+        self.assertTrue(any("goto" in item.message for item in unsupported_control.diagnostics))
         self.assertFalse(malformed_assignment.complete)
         self.assertFalse(malformed_expression.complete)
         self.assertFalse(unterminated_string.complete)
@@ -393,11 +394,11 @@ class PhpParserTests(unittest.TestCase):
         self.assertTrue(interpolated.complete, interpolated.diagnostics)
         self.assertEqual(interpolated.statements[0].value.variables, ("$name",))
         complex_interpolation = parse_php('<?php $value = "{$user->name}";')
-        self.assertFalse(complex_interpolation.complete)
-        self.assertTrue(any(
-            item.code == "unsupported_interpolation"
-            for item in complex_interpolation.diagnostics
-        ))
+        self.assertTrue(complex_interpolation.complete, complex_interpolation.diagnostics)
+        self.assertEqual(
+            complex_interpolation.statements[0].value.variables,
+            ("$user",),
+        )
         embedded_tag = parse_php("<?php $value = '<?php';")
         self.assertTrue(embedded_tag.complete, embedded_tag.diagnostics)
 
@@ -435,13 +436,90 @@ class PhpParserTests(unittest.TestCase):
             (("$file",),),
         )
 
+    def test_namespace_use_and_class_members_are_supported(self) -> None:
+        program = parse_php(
+            "<?php namespace Vendor\\Package; use Other\\Service as ServiceAlias; "
+            "interface Contract { public function get(); } "
+            "trait Calls { public function call(){ return $this->service(); } } "
+            "class Handler implements Contract { use Calls; "
+            "private $service = null; public function get(){ "
+            "$service = new \\Other\\Service(); "
+            "return \\Other\\Service::fetch($service); } }"
+        )
+
+        self.assertTrue(program.complete, program.diagnostics)
+        self.assertEqual(program.namespace, "Vendor\\Package")
+        self.assertEqual(program.imports, ["Other\\Service as ServiceAlias"])
+        self.assertEqual(len(program.classes), 3)
+        handler = next(item for item in program.classes if item.name == "Handler")
+        self.assertEqual(
+            handler.methods[0].body[-1].value.calls[0].name,
+            "\\Other\\Service::fetch",
+        )
+
+    def test_switch_cases_and_break_are_supported(self) -> None:
+        program = parse_php(
+            "<?php function run($kind){ switch($kind){ "
+            "case 'one': echo $_GET['x']; break; "
+            "case 'two': echo 'safe'; break; "
+            "default: echo 'default'; } }"
+        )
+        self.assertTrue(program.complete, program.diagnostics)
+        self.assertEqual(len(program.functions[0].body), 1)
+
+    def test_closures_and_arrow_functions_are_supported(self) -> None:
+        program = parse_php(
+            "<?php function run($values){ $mapper = function($x) use ($values) "
+            "{ return wrap($x, $values); }; "
+            "return array_map(fn($x) => convert($x), $values); }"
+        )
+        self.assertTrue(program.complete, program.diagnostics)
+        calls = program.functions[0].body[-1].value.calls
+        self.assertEqual(calls[0].name, "array_map")
+        self.assertEqual(calls[0].argument_calls[0][0].name, "convert")
+
+    def test_loops_list_destructuring_and_try_catch_are_supported(self) -> None:
+        program = parse_php(
+            "<?php function run($rows){ foreach($rows as list($key, $value)) "
+            "{ consume($value); } for($i=0; $i<2; $i++){ consume($i); } "
+            "while($rows){ break; } do { continue; } while(false); "
+            "try { throw new \\RuntimeException(); } "
+            "catch (\\RuntimeException $error) { consume($error); } "
+            "finally { cleanup(); } }"
+        )
+        self.assertTrue(program.complete, program.diagnostics)
+        self.assertEqual(len(program.functions[0].body), 5)
+
+    def test_ternary_coalescing_static_calls_and_interpolation_are_supported(self) -> None:
+        program = parse_php(
+            '<?php function run($input){ $value = $input ?? fallback(); '
+            '$value ??= Other::defaultValue(); '
+            '$output = $value ? escape($value) : fallback(); '
+            '$object = new Other\\Handler(); $object->render(); '
+            '$text = "value: {$object->name} $value"; '
+            '$doc = <<<TEXT\nvalue: $value\nTEXT; '
+            "$mapping = ['x' => $value]; return $output; }"
+        )
+        self.assertTrue(program.complete, program.diagnostics)
+        assignments = program.functions[0].body
+        self.assertEqual(assignments[0].value.calls[0].name, "fallback")
+        self.assertEqual(assignments[1].operator, "??=")
+        self.assertEqual(assignments[1].value.calls[0].name, "Other::defaultValue")
+        self.assertIn("$value", assignments[-2].value.variables)
+        self.assertIn("$value", assignments[-3].value.variables)
+
     def test_parser_marks_line_limit_as_incomplete(self) -> None:
+        accepted = parse_php("<?php\n" + "\n" * 1_000)
+        self.assertTrue(accepted.complete, accepted.diagnostics)
+        at_limit = parse_php("<?php" + "\n" * (MAX_PHP_LINES - 1))
+        self.assertTrue(at_limit.complete, at_limit.diagnostics)
         program = parse_php("<?php\n" + "\n" * MAX_PHP_LINES)
 
         self.assertFalse(program.complete)
         self.assertTrue(any(
             item.code == "line_limit" for item in program.diagnostics
         ))
+        self.assertEqual(program.diagnostics[0].location.line, 1)
 
 
 class TaintAnalysisTests(unittest.TestCase):
@@ -521,6 +599,32 @@ class TaintAnalysisTests(unittest.TestCase):
         )
         self.assertEqual(len(safe.flows), 1)
         self.assertTrue(safe.flows[0].mitigated)
+
+    def test_namespace_switch_foreach_and_dynamic_property_preserve_sql_taint(self) -> None:
+        program = parse_php(
+            "<?php namespace WPGMZA; "
+            "class RestAPI { public function markers(){ global $wpdb; "
+            "$fields = null; "
+            "if(isset($_GET['fields'])) { $fields = explode(',', $_GET['fields']); } "
+            "else if(!empty($_GET['fields'])) { $fields = $_GET['fields']; } "
+            "switch($_SERVER['REQUEST_METHOD']) { "
+            "case 'GET': if(!empty($fields)) { "
+            "foreach($fields as $key => $value) { "
+            "$markerFilter->{$key} = $value; "
+            "$fields[$key] = preg_replace('/[a-z_]/i', '', $value); } "
+            "$imploded = implode(',', $fields); "
+            "$stmt = $wpdb->prepare(\"SELECT $imploded FROM markers\"); "
+            "$results = $wpdb->get_results($stmt); break; } "
+            "default: break; } } }"
+        )
+        self.assertTrue(program.complete, program.diagnostics)
+        result = analyze_program(program)
+        self.assertTrue(result.complete, result.diagnostics)
+        sql_flows = [flow for flow in result.flows if flow.context == "sql"]
+        self.assertTrue(sql_flows)
+        self.assertEqual(sql_flows[0].source.name, "$_GET")
+        self.assertEqual(sql_flows[0].sink.name, "$wpdb->get_results")
+        self.assertFalse(sql_flows[0].mitigated)
 
     def test_default_call_depth_is_bounded_to_three(self) -> None:
         source = (

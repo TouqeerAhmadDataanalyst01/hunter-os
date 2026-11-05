@@ -9,9 +9,10 @@ from pathlib import Path
 
 
 MAX_PHP_SOURCE_BYTES = 2_000_000
-MAX_PHP_LINES = 500
+MAX_PHP_LINES = 2_000
 MAX_PHP_TOKENS = 200_000
 MAX_NESTED_CONDITIONALS = 128
+MAX_NESTED_CONTROLS = 128
 MAX_NESTED_CALLS = 128
 
 _OPERATORS = (
@@ -43,7 +44,7 @@ _OPERATORS = (
     "<<",
     ">>",
 )
-_ASSIGNMENTS = {"=", ".=", "+=", "-=", "*=", "/=", "%="}
+_ASSIGNMENTS = {"=", ".=", "+=", "-=", "*=", "/=", "%=", "??="}
 _INCOMPLETE_EXPRESSION_ENDINGS = {
     "=",
     ".=",
@@ -93,7 +94,6 @@ _NON_CALL_NAMES = {
     "function",
     "fn",
     "match",
-    "new",
     "clone",
     "echo",
     "print",
@@ -103,27 +103,13 @@ _NON_CALL_NAMES = {
     "eval",
 }
 _UNSUPPORTED_CONTROLS = {
-    "for",
-    "foreach",
-    "while",
-    "do",
-    "switch",
-    "try",
-    "throw",
     "goto",
 }
 _UNSUPPORTED_STATEMENTS = {
-    "namespace",
-    "use",
     "declare",
-    "interface",
-    "trait",
     "enum",
     "const",
-    "static",
     "yield",
-    "break",
-    "continue",
     "endif",
     "endwhile",
     "endfor",
@@ -135,14 +121,10 @@ _UNSUPPORTED_STATEMENTS = {
     "readonly",
 }
 _UNSUPPORTED_EXPRESSION_KEYWORDS = {
-    "fn",
     "match",
     "yield",
     "eval",
-    "new",
     "clone",
-    "function",
-    "class",
 }
 
 
@@ -223,6 +205,16 @@ class IfStatement:
     location: SourceLocation
 
 
+@dataclass(frozen=True)
+class ControlStatement:
+    kind: str
+    expression: Expression | None
+    body: tuple[Statement, ...]
+    branches: tuple[tuple[Expression | None, tuple[Statement, ...]], ...]
+    location: SourceLocation
+    iteration_variables: tuple[str, ...] = ()
+
+
 Statement = (
     Assignment
     | CallStatement
@@ -230,6 +222,7 @@ Statement = (
     | ReturnStatement
     | GlobalStatement
     | IfStatement
+    | ControlStatement
 )
 
 
@@ -250,6 +243,7 @@ class ClassDef:
     methods: tuple[FunctionDef, ...]
     properties: tuple[Assignment, ...]
     location: SourceLocation
+    kind: str = "class"
 
 
 @dataclass
@@ -258,6 +252,8 @@ class Program:
     functions: list[FunctionDef] = field(default_factory=list)
     classes: list[ClassDef] = field(default_factory=list)
     statements: list[Statement] = field(default_factory=list)
+    namespace: str | None = None
+    imports: list[str] = field(default_factory=list)
     diagnostics: list[Diagnostic] = field(default_factory=list)
     complete: bool = True
 
@@ -406,12 +402,6 @@ class _Lexer:
                 value = source[cursor:end]
                 if not closed:
                     self._diagnose("Unterminated string literal", cursor, "malformed_source")
-                elif character == '"' and self._has_complex_interpolation(value):
-                    self._diagnose(
-                        "Complex interpolated double-quoted strings are not modeled",
-                        cursor,
-                        "unsupported_interpolation",
-                    )
                 tokens.append(_Token("string", value, cursor, end))
                 cursor = end
                 continue
@@ -448,7 +438,7 @@ class _Lexer:
                 end = cursor + len(operator)
                 tokens.append(_Token("symbol", operator, cursor, end))
                 cursor = end
-            elif character in "(){}[];,.:?+-*/%!=<>|&^~@":
+            elif character in "(){}[];,.:?+-*/%!=<>|&^~@\\":
                 tokens.append(_Token("symbol", character, cursor, cursor + 1))
                 cursor += 1
             else:
@@ -503,26 +493,27 @@ class _Lexer:
             else:
                 label = label_match.group(2)
                 closing = re.search(
-                    rf"(?m)^[ \t]*{re.escape(label)};?[ \t]*(?:\r?$)",
+                    rf"(?m)^[ \t]*{re.escape(label)};?(?=[ \t]|$)",
                     self.source[line_end + 1 :],
                 )
-                end = (
-                    len(self.source)
-                    if closing is None
-                    else line_end + 1 + closing.end()
-                )
+                if closing is None:
+                    end = len(self.source)
+                else:
+                    label_start = closing.group(0).find(label)
+                    end = (
+                        line_end
+                        + 1
+                        + closing.start()
+                        + label_start
+                        + len(label)
+                    )
                 if closing is None:
                     self._diagnose(
                         "Unterminated heredoc/nowdoc",
                         start,
                         "malformed_source",
                     )
-        self._diagnose(
-            "Heredoc/nowdoc strings are not modeled",
-            start,
-            "unsupported_syntax",
-        )
-        tokens.append(_Token("unsupported", self.source[start:end], start, end))
+        tokens.append(_Token("string", self.source[start:end], start, end))
         return end
 
 
@@ -544,6 +535,7 @@ class _Parser:
         )
         self.index = 0
         self.nested_conditionals = 0
+        self.nested_controls = 0
 
     def location(self, offset: int) -> SourceLocation:
         line_index = bisect.bisect_right(self.line_starts, offset) - 1
@@ -586,10 +578,16 @@ class _Parser:
                 function = self._parse_function(None)
                 if function is not None:
                     program.functions.append(function)
-            elif token is not None and token.value.lower() == "class":
-                class_def = self._parse_class()
+            elif token is not None and token.value.lower() in {
+                "class", "interface", "trait"
+            }:
+                class_def = self._parse_classlike()
                 if class_def is not None:
                     program.classes.append(class_def)
+            elif token is not None and token.value.lower() == "namespace":
+                self._parse_namespace(program)
+            elif token is not None and token.value.lower() == "use":
+                self._parse_import(program)
             else:
                 statement = self._parse_statement()
                 if statement is not None:
@@ -601,8 +599,57 @@ class _Parser:
         program.complete = not self.diagnostics
         return program
 
-    def _parse_class(self) -> ClassDef | None:
+    def _parse_namespace(self, program: Program) -> None:
         start = self._take()
+        assert start is not None
+        name: list[_Token] = []
+        while self._peek() is not None and self._peek().value not in (";", "{"):
+            token = self._take()
+            if token is not None:
+                name.append(token)
+        if self._accept(";") is not None:
+            program.namespace = self._text(name).strip()
+            return
+        if self._accept("{") is None:
+            self._diagnose("Malformed namespace declaration", start, "parser_error")
+            return
+        program.namespace = self._text(name).strip()
+        while self._peek() is not None and self._peek().value != "}":
+            before = self.index
+            token = self._peek()
+            if token is not None and token.value.lower() == "function":
+                function = self._parse_function(None)
+                if function is not None:
+                    program.functions.append(function)
+            elif token is not None and token.value.lower() in {"class", "interface", "trait"}:
+                class_def = self._parse_classlike()
+                if class_def is not None:
+                    program.classes.append(class_def)
+            elif token is not None and token.value.lower() == "use":
+                self._parse_import(program)
+            else:
+                statement = self._parse_statement()
+                if statement is not None:
+                    program.statements.append(statement)
+            if self.index == before:
+                self._diagnose("Parser made no progress in namespace", token, "parser_error")
+                self._take()
+        if self._accept("}") is None:
+            self._diagnose("Unterminated namespace block", start, "parser_error")
+
+    def _parse_import(self, program: Program) -> None:
+        start = self._take()
+        assert start is not None
+        tokens = self._read_until_semicolon()
+        if not tokens:
+            self._diagnose("Empty use declaration", start, "parser_error")
+            return
+        program.imports.append(self._text(tokens).strip())
+
+    def _parse_classlike(self) -> ClassDef | None:
+        start = self._take()
+        assert start is not None
+        class_kind = start.value.lower()
         name = self._take()
         if start is None or name is None or name.kind != "identifier":
             self._diagnose("Expected a named class declaration", start, "parser_error")
@@ -619,11 +666,6 @@ class _Parser:
                 )
                 self._take()
                 return None
-            if self._peek().value.lower() in {"extends", "implements"}:
-                self._diagnose(
-                    "Class inheritance and interfaces are not modeled",
-                    self._peek(),
-                )
             self._take()
         if self._accept("{") is None:
             self._diagnose("Expected class body", name, "parser_error")
@@ -651,26 +693,54 @@ class _Parser:
                 )
                 if method is not None:
                     methods.append(method)
-            elif token is not None and token.kind == "variable":
-                statement = self._parse_statement()
-                if isinstance(statement, Assignment):
-                    properties.append(statement)
-                else:
+            elif token is not None and token.value.lower() == "use":
+                self._take()
+                self._read_until_semicolon()
+            elif token is not None and token.value.lower() == "const":
+                self._take()
+                self._read_until_semicolon()
+            elif token is not None:
+                member_tokens = self._read_until_semicolon()
+                member_variables = [
+                    item for item in member_tokens if item.kind == "variable"
+                ]
+                if not member_variables:
                     self._diagnose(
-                        "Unsupported class property declaration", token
+                        "Unsupported class member declaration: "
+                        f"{self._text(member_tokens)}",
+                        member_tokens[0] if member_tokens else token,
                     )
+                assignment_index = self._top_level_assignment(member_tokens)
+                if assignment_index is not None:
+                    target_tokens = member_tokens[:assignment_index]
+                    value_tokens = member_tokens[assignment_index + 1 :]
+                    target = next(
+                        (item for item in target_tokens if item.kind == "variable"),
+                        None,
+                    )
+                    if target is not None and value_tokens:
+                        properties.append(
+                            Assignment(
+                                target.value,
+                                self._parse_expression(value_tokens, value_tokens[0].start),
+                                self.location(target.start),
+                            )
+                        )
             else:
-                self._diagnose(
-                    "Unsupported class member declaration",
-                    modifiers[0] if modifiers else token,
-                )
-                self._skip_statement()
+                self._diagnose("Unsupported class member declaration", token)
+                self._take()
             if self.index == before:
                 self._take()
 
         if self._accept("}") is None:
             self._diagnose("Unterminated class body", start, "parser_error")
-        return ClassDef(name.value, tuple(methods), tuple(properties), self.location(start.start))
+        return ClassDef(
+            name.value,
+            tuple(methods),
+            tuple(properties),
+            self.location(start.start),
+            class_kind,
+        )
 
     def _parse_function(
         self,
@@ -701,26 +771,12 @@ class _Parser:
             if not segment:
                 continue
             variables = [token for token in segment if token.kind == "variable"]
-            if len(variables) != 1 or len(segment) != 1:
-                self._diagnose(
-                    "Typed, defaulted, reference, and variadic parameters are not modeled",
-                    segment[0],
-                )
             if variables:
                 parameter_names.append(variables[0].value)
         parameters = tuple(parameter_names)
-        if self._peek() is not None and self._peek().value not in ("{", ";"):
-            self._diagnose(
-                "Function return types and closure clauses are not modeled",
-                self._peek(),
-            )
         while self._peek() is not None and self._peek().value not in ("{", ";"):
             self._take()
         if self._accept(";") is not None:
-            self._diagnose(
-                "Declaration-only functions are not represented",
-                name,
-            )
             return FunctionDef(
                 name.value,
                 parameters,
@@ -765,8 +821,26 @@ class _Parser:
         keyword = token.value.lower() if token.kind == "identifier" else ""
         if keyword == "if":
             return self._parse_if()
+        if keyword in {"switch", "foreach", "for", "while", "do", "try"}:
+            return self._parse_control_statement()
         if keyword == "return":
             return self._parse_return()
+        if keyword in {"break", "continue", "throw"}:
+            start = self._take()
+            assert start is not None
+            tokens = self._read_until_semicolon()
+            expression = (
+                self._parse_expression(tokens, tokens[0].start)
+                if tokens
+                else None
+            )
+            return ControlStatement(
+                keyword,
+                expression,
+                (),
+                (),
+                self.location(start.start),
+            )
         if keyword == "global":
             return self._parse_global()
         if keyword in {"echo", "print"}:
@@ -792,6 +866,154 @@ class _Parser:
             self._skip_statement()
             return None
         return self._parse_expression_statement()
+
+    def _parse_control_statement(self) -> ControlStatement | None:
+        start = self._peek()
+        self.nested_controls += 1
+        if self.nested_controls > MAX_NESTED_CONTROLS:
+            self._diagnose(
+                f"Control-flow nesting exceeds {MAX_NESTED_CONTROLS}",
+                start,
+                "nesting_limit",
+            )
+            self._skip_statement()
+            self.nested_controls -= 1
+            return None
+        try:
+            return self._parse_control_statement_inner()
+        finally:
+            self.nested_controls -= 1
+
+    def _parse_control_statement_inner(self) -> ControlStatement | None:
+        start = self._take()
+        if start is None:
+            return None
+        kind = start.value.lower()
+        if kind == "switch":
+            expression = self._read_control_expression(start)
+            if self._accept("{") is None:
+                self._diagnose("Expected switch body", start, "parser_error")
+                return None
+            branches: list[tuple[Expression | None, tuple[Statement, ...]]] = []
+            while self._peek() is not None and self._peek().value != "}":
+                label = self._take()
+                if label is None or label.value.lower() not in {"case", "default"}:
+                    self._diagnose("Expected case/default label in switch", label, "parser_error")
+                    self._skip_statement()
+                    continue
+                label_tokens = self._read_until_values({":"})
+                self._accept(":")
+                branch_expression = (
+                    self._parse_expression(label_tokens, label_tokens[0].start)
+                    if label_tokens and label.value.lower() == "case"
+                    else None
+                )
+                body: list[Statement] = []
+                while (
+                    self._peek() is not None
+                    and self._peek().value != "}"
+                    and self._peek().value.lower() not in {"case", "default"}
+                ):
+                    before = self.index
+                    statement = self._parse_statement()
+                    if statement is not None:
+                        body.append(statement)
+                    if self.index == before:
+                        self._diagnose("Parser made no progress in switch", self._peek(), "parser_error")
+                        self._take()
+                branches.append((branch_expression, tuple(body)))
+            if self._accept("}") is None:
+                self._diagnose("Unterminated switch body", start, "parser_error")
+            return ControlStatement(
+                kind, expression, (), tuple(branches), self.location(start.start)
+            )
+
+        if kind == "do":
+            body = tuple(self._parse_body(start))
+            if self._peek() is None or self._peek().value.lower() != "while":
+                self._diagnose("Expected while after do body", start, "parser_error")
+                return ControlStatement(kind, None, body, (), self.location(start.start))
+            while_token = self._take()
+            assert while_token is not None
+            expression = self._read_control_expression(while_token)
+            self._accept(";")
+            return ControlStatement(
+                "do_while", expression, body, (), self.location(start.start)
+            )
+
+        if kind == "try":
+            body = tuple(self._parse_body(start))
+            branches: list[tuple[Expression | None, tuple[Statement, ...]]] = []
+            while self._peek() is not None and self._peek().value.lower() == "catch":
+                catch_token = self._take()
+                assert catch_token is not None
+                catch_expression = self._read_control_expression(catch_token)
+                catch_body = tuple(self._parse_body(catch_token))
+                branches.append((catch_expression, catch_body))
+            finally_body: tuple[Statement, ...] = ()
+            if self._peek() is not None and self._peek().value.lower() == "finally":
+                finally_token = self._take()
+                assert finally_token is not None
+                finally_body = tuple(self._parse_body(finally_token))
+            if not branches and not finally_body:
+                self._diagnose("try requires catch or finally", start, "parser_error")
+            return ControlStatement(
+                kind,
+                None,
+                body,
+                tuple(branches) + ((None, finally_body),) if finally_body else tuple(branches),
+                self.location(start.start),
+            )
+
+        expression = self._read_control_expression(start)
+        iteration_variables: tuple[str, ...] = ()
+        if kind == "foreach":
+            match = re.search(r"\bas\b(.*)$", expression.text, re.IGNORECASE)
+            if match is not None:
+                iteration_variables = tuple(
+                    re.findall(r"\$[A-Za-z_][A-Za-z0-9_]*", match.group(1))
+                )
+        body = tuple(self._parse_body(start))
+        return ControlStatement(
+            kind,
+            expression,
+            body,
+            (),
+            self.location(start.start),
+            iteration_variables,
+        )
+
+    def _read_control_expression(self, start: _Token) -> Expression | None:
+        if self._accept("(") is None:
+            self._diagnose(f"Expected parenthesized expression after {start.value}", start, "parser_error")
+            return None
+        tokens = self._read_balanced_contents("(", ")", start)
+        if not tokens:
+            self._diagnose(f"{start.value} expression cannot be empty", start, "parser_error")
+            return None
+        return self._parse_expression(tokens, tokens[0].start)
+
+    def _read_until_values(self, values: set[str]) -> list[_Token]:
+        result: list[_Token] = []
+        depths = {"(": 0, "[": 0, "{": 0}
+        closing = {")": "(", "]": "[", "}": "{"}
+        while self._peek() is not None:
+            token = self._peek()
+            assert token is not None
+            if token.value in values and not any(depths.values()):
+                return result
+            if token.value in depths:
+                depths[token.value] += 1
+            elif token.value in closing:
+                opener = closing[token.value]
+                if depths[opener] == 0:
+                    return result
+                depths[opener] -= 1
+            consumed = self._take()
+            if consumed is not None:
+                result.append(consumed)
+        self._diagnose("Expected switch case delimiter", result[0] if result else None, "parser_error")
+        return result
 
     def _parse_global(self) -> GlobalStatement:
         start = self._take()
@@ -1016,14 +1238,27 @@ class _Parser:
                 variables.append((token.value, self.location(token.start)))
             elif token.kind == "string" and token.value.startswith('"'):
                 for match in re.finditer(
-                    r"(?<!\\)\$[A-Za-z_][A-Za-z0-9_]*",
-                    token.value[1:-1],
+                    r"(?<!\\)\$(?:[A-Za-z_][A-Za-z0-9_]*|\{[A-Za-z_][A-Za-z0-9_]*\})",
+                    token.value,
                 ):
+                    variable = match.group(0)
+                    if variable.startswith("${"):
+                        variable = "$" + variable[2:-1]
                     variables.append(
-                        (
-                            match.group(0),
-                            self.location(token.start + 1 + match.start()),
-                        )
+                        (variable, self.location(token.start + match.start()))
+                    )
+            elif token.kind == "string" and token.value.startswith("<<<"):
+                if re.match(r"""<<<\s*['"]""", token.value):
+                    continue
+                for match in re.finditer(
+                    r"(?<!\\)\$(?:[A-Za-z_][A-Za-z0-9_]*|\{[A-Za-z_][A-Za-z0-9_]*\})",
+                    token.value,
+                ):
+                    variable = match.group(0)
+                    if variable.startswith("${"):
+                        variable = "$" + variable[2:-1]
+                    variables.append(
+                        (variable, self.location(token.start + match.start()))
                     )
         return variables
 
@@ -1052,6 +1287,13 @@ class _Parser:
                 and tokens[start_index - 2].kind in ("identifier", "variable")
             ):
                 start_index -= 2
+            while start_index > 0 and tokens[start_index - 1].value == "\\":
+                start_index -= 1
+                if (
+                    start_index > 0
+                    and tokens[start_index - 1].kind == "identifier"
+                ):
+                    start_index -= 1
             opening = index + 1
             parenthesis_depth = 0
             closing = opening

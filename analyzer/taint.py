@@ -224,6 +224,17 @@ def _call_matches(call_name: str, registered_name: str) -> bool:
     )
 
 
+def _sanitizer_is_effective(sanitizer: SanitizerSpec, call: Call) -> bool:
+    if sanitizer.name.casefold() != "$wpdb->prepare":
+        return True
+    if len(call.arguments) < 2:
+        return False
+    placeholders = re.findall(
+        r"(?<!%)%(?:\d+\$)?[sdfi]", call.arguments[0], re.IGNORECASE
+    )
+    return bool(placeholders) and len(placeholders) <= len(call.arguments) - 1
+
+
 class _Analyzer:
     def __init__(
         self,
@@ -504,7 +515,12 @@ class _Analyzer:
             return source_values
 
         sanitizer = next(
-            (item for item in self.sanitizers if _call_matches(call.name, item.name)),
+            (
+                item
+                for item in self.sanitizers
+                if _call_matches(call.name, item.name)
+                and _sanitizer_is_effective(item, call)
+            ),
             None,
         )
         if sanitizer is not None:

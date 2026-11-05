@@ -498,6 +498,30 @@ class TaintAnalysisTests(unittest.TestCase):
                 self.assertEqual(len(result.flows), 1)
                 self.assertFalse(result.flows[0].mitigated)
 
+    def test_wpdb_prepare_requires_placeholders_and_bound_values(self) -> None:
+        unsafe = analyze_program(
+            parse_php(
+                '<?php function query(){ global $wpdb; $id = $_GET["id"]; '
+                '$sql = $wpdb->prepare("SELECT * FROM users WHERE id=$id"); '
+                '$wpdb->query($sql); }',
+                "prepare-without-arguments.php",
+            )
+        )
+        self.assertEqual(len(unsafe.flows), 1)
+        self.assertFalse(unsafe.flows[0].mitigated)
+
+        safe = analyze_program(
+            parse_php(
+                '<?php function query(){ global $wpdb; $id = $_GET["id"]; '
+                '$sql = $wpdb->prepare('
+                '"SELECT * FROM users WHERE id=%d", $id); '
+                '$wpdb->query($sql); }',
+                "prepare-with-arguments.php",
+            )
+        )
+        self.assertEqual(len(safe.flows), 1)
+        self.assertTrue(safe.flows[0].mitigated)
+
     def test_default_call_depth_is_bounded_to_three(self) -> None:
         source = (
             "<?php function first($x){ return second($x); } "

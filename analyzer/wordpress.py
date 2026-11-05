@@ -12,6 +12,7 @@ from analyzer.php_parser import (
     Assignment,
     Call,
     CallStatement,
+    ControlStatement,
     Expression,
     FunctionDef,
     IfStatement,
@@ -76,7 +77,9 @@ class ScanSummary:
 class TaintScanSummary:
     findings: list[dict[str, object]] = field(default_factory=list)
     audit: list[dict[str, object]] = field(default_factory=list)
+    recognized_audits: list[dict[str, object]] = field(default_factory=list)
     diagnostics: list[dict[str, object]] = field(default_factory=list)
+    query_build_available: bool = False
     complete: bool = True
 
 
@@ -583,7 +586,333 @@ def _walk_statements(
         if isinstance(statement, IfStatement):
             result.extend(_walk_statements(statement.then_body))
             result.extend(_walk_statements(statement.else_body))
+        elif isinstance(statement, ControlStatement):
+            result.extend(_walk_statements(statement.body))
+            for _, branch_body in statement.branches:
+                result.extend(_walk_statements(branch_body))
     return result
+
+
+def _database_column_allowlist_methods(
+    program: Program,
+) -> set[tuple[str | None, str]]:
+    methods = set()
+    for function in _program_functions(program):
+        statements = _walk_statements(function.body)
+        whitelist_variables = {
+            statement.target
+            for statement in statements
+            if isinstance(statement, Assignment)
+            and any(
+                call.name.casefold().endswith("->get_col")
+                and any(
+                    "show columns" in argument.casefold()
+                    for argument in call.arguments
+                )
+                for call in statement.value.calls
+            )
+        }
+        for statement in statements:
+            if not isinstance(statement, IfStatement):
+                continue
+            condition = statement.condition
+            if not re.search(r"!==\s*false\b", condition.text, re.IGNORECASE):
+                continue
+            array_search = next(
+                (
+                    call
+                    for call in condition.calls
+                    if call.name.casefold() == "array_search"
+                    and len(call.arguments) >= 2
+                ),
+                None,
+            )
+            if array_search is None:
+                continue
+            candidate_match = re.fullmatch(
+                r"\s*(\$[A-Za-z_][A-Za-z0-9_]*)\s*",
+                array_search.arguments[0],
+            )
+            if candidate_match is None:
+                continue
+            candidate = candidate_match.group(1)
+            whitelist_argument = re.fullmatch(
+                r"\s*(\$[A-Za-z_][A-Za-z0-9_]*)\s*",
+                array_search.arguments[1],
+            )
+            if (
+                whitelist_argument is None
+                or whitelist_argument.group(1) not in whitelist_variables
+            ):
+                continue
+            append_targets = {
+                item.target[:-2]
+                for item in _walk_statements(statement.then_body)
+                if isinstance(item, Assignment)
+                and re.fullmatch(r"\$[A-Za-z_][A-Za-z0-9_]*\[\]", item.target)
+                and candidate in item.value.variables
+            }
+            returned_arrays = {
+                item.value.text.strip()
+                for item in statements
+                if isinstance(item, ReturnStatement) and item.value is not None
+            }
+            if append_targets & returned_arrays:
+                methods.add(
+                    (
+                        function.class_name.casefold()
+                        if function.class_name
+                        else None,
+                        function.name.casefold(),
+                    )
+                )
+                break
+    return methods
+
+
+def _is_allowlist_method_call(
+    call_name: str,
+    function: FunctionDef,
+    safe_methods: set[tuple[str | None, str]],
+) -> bool:
+    method_name = call_name.rsplit("->", 1)[-1].casefold()
+    if function.class_name:
+        return (
+            call_name.casefold() == f"$this->{method_name}"
+            and (function.class_name.casefold(), method_name) in safe_methods
+        )
+    return (
+        "->" not in call_name
+        and call_name.casefold() == method_name
+        and (None, method_name) in safe_methods
+    )
+
+
+def _allowlisted_query_build_audits(
+    program: Program, relative_file: str
+) -> list[dict[str, object]]:
+    safe_methods = _database_column_allowlist_methods(program)
+    if not safe_methods:
+        return []
+
+    for function in _program_functions(program):
+        statements = sorted(
+            _walk_statements(function.body),
+            key=lambda statement: statement.location.offset,
+        )
+        tainted: dict[str, tuple[str, SourceLocation]] = {}
+        allowlisted: dict[str, tuple[str, SourceLocation, SourceLocation]] = {}
+        query_variables: set[str] = set()
+        query_fields: dict[str, tuple[str, SourceLocation]] = {}
+        built_queries: dict[str, tuple[str, SourceLocation]] = {}
+        source_names = {
+            source.name.casefold()
+            for source in DEFAULT_SOURCES
+            if source.kind == "variable"
+        }
+
+        for statement in statements:
+            if isinstance(statement, Assignment):
+                value = statement.value
+                target = statement.target
+                if re.fullmatch(r"\$[A-Za-z_][A-Za-z0-9_]*", target):
+                    source_data = next(
+                        (
+                            (
+                                value.variables[index],
+                                value.variable_locations[index]
+                                if index < len(value.variable_locations)
+                                else statement.location,
+                            )
+                            for index, name in enumerate(value.variables)
+                            if name.casefold() in source_names
+                        ),
+                        None,
+                    )
+                    inherited = next(
+                        (tainted[name] for name in value.variables if name in tainted),
+                        None,
+                    )
+                    if source_data or inherited:
+                        tainted[target] = source_data or inherited
+
+                    sanitizer_call = next(
+                        (
+                            call
+                            for call in value.calls
+                            if _is_allowlist_method_call(
+                                call.name, function, safe_methods
+                            )
+                        ),
+                        None,
+                    )
+                    arguments = (
+                        tuple(
+                            variable
+                            for group in sanitizer_call.argument_variables
+                            for variable in group
+                        )
+                        if sanitizer_call
+                        else ()
+                    )
+                    tainted_argument = next(
+                        (tainted[name] for name in arguments if name in tainted),
+                        None,
+                    )
+                    if sanitizer_call and tainted_argument:
+                        allowlisted[target] = (
+                            tainted_argument[0],
+                            tainted_argument[1],
+                            sanitizer_call.location,
+                        )
+
+                    if re.search(r"\bnew\s+\\?Query\s*\(", value.text, re.IGNORECASE):
+                        query_variables.add(target)
+
+                    build_call = next(
+                        (
+                            call
+                            for call in value.calls
+                            if call.name.casefold().endswith("->build")
+                            and not call.arguments
+                        ),
+                        None,
+                    )
+                    if build_call is not None:
+                        receiver_match = re.match(
+                            r"(\$[A-Za-z_][A-Za-z0-9_]*)->build$",
+                            build_call.name,
+                            re.IGNORECASE,
+                        )
+                        if (
+                            receiver_match is not None
+                            and receiver_match.group(1) in query_variables
+                            and receiver_match.group(1) in query_fields
+                        ):
+                            built_queries[target] = (
+                                receiver_match.group(1),
+                                build_call.location,
+                            )
+                else:
+                    property_match = re.fullmatch(
+                        r"(\$[A-Za-z_][A-Za-z0-9_]*)->fields",
+                        statement.target,
+                        re.IGNORECASE,
+                    )
+                    safe_variable = next(
+                        (
+                            variable
+                            for variable in value.variables
+                            if variable in allowlisted
+                        ),
+                        None,
+                    )
+                    if (
+                        property_match is not None
+                        and property_match.group(1) in query_variables
+                        and safe_variable is not None
+                    ):
+                        query_fields[property_match.group(1)] = (
+                            safe_variable,
+                            statement.location,
+                        )
+
+            expressions = (
+                [statement.value]
+                if isinstance(statement, Assignment)
+                else [statement.expression]
+                if isinstance(statement, CallStatement)
+                else [statement.condition]
+                if isinstance(statement, IfStatement)
+                else [statement.value]
+                if isinstance(statement, ReturnStatement) and statement.value
+                else []
+            )
+            for expression in expressions:
+                for call in expression.calls:
+                    if call.name.casefold() not in {
+                        "$wpdb->get_results",
+                        "$wpdb->get_row",
+                        "$wpdb->get_var",
+                    }:
+                        continue
+                    for arguments in call.argument_variables:
+                        built = next(
+                            (built_queries[name] for name in arguments if name in built_queries),
+                            None,
+                        )
+                        if built is None:
+                            continue
+                        query_variable, build_location = built
+                        safe_variable, property_location = query_fields[query_variable]
+                        source_name, source_location, sanitizer_location = (
+                            allowlisted[safe_variable]
+                        )
+                        finding = {
+                            "file": relative_file,
+                            "line": call.location.line,
+                            "type": "SQL Injection",
+                            "status": "DOWNGRADED",
+                            "confidence": "low",
+                            "confidence_reason": (
+                                "Downgraded because database column names pass through a "
+                                "schema-derived allowlist before reaching the query builder."
+                            ),
+                            "context": "sql",
+                            "function": function.name,
+                            "trace": [
+                                {
+                                    "kind": "source",
+                                    "name": source_name,
+                                    **_location_record(source_location, relative_file),
+                                },
+                                {
+                                    "kind": "sanitizer",
+                                    "name": "database-column allowlist",
+                                    **_location_record(sanitizer_location, relative_file),
+                                },
+                                {
+                                    "kind": "object_property",
+                                    "name": "->fields",
+                                    **_location_record(property_location, relative_file),
+                                },
+                                {
+                                    "kind": "call",
+                                    "name": "build",
+                                    **_location_record(build_location, relative_file),
+                                },
+                                {
+                                    "kind": "sink",
+                                    "name": call.name,
+                                    **_location_record(call.location, relative_file),
+                                },
+                            ],
+                            "sanitizer_evidence": [
+                                {
+                                    "name": "database-column allowlist",
+                                    **_location_record(sanitizer_location, relative_file),
+                                    "effective_contexts": ["sql"],
+                                    "effective": True,
+                                }
+                            ],
+                            "auth_evidence": [],
+                            "note": "allowlist fix recognized",
+                            "entry_point": "unknown",
+                        }
+                        return [
+                            {
+                                "reason": "allowlist fix recognized",
+                                "original_confidence": "medium",
+                                "original_confidence_reason": (
+                                    "Tainted fields pass through a schema-derived allowlist "
+                                    "before reaching Query::build()."
+                                ),
+                                "downgraded_confidence": "low",
+                                "finding": finding,
+                                "note": "allowlist fix recognized",
+                            }
+                        ]
+    return []
 
 
 _AJAX_SENSITIVE_CALLS = {
@@ -1209,6 +1538,8 @@ def scan_plugin_with_taint(
         )
 
     _finalize_taint_summary(result)
+    if result.query_build_available:
+        result.audit.extend(result.recognized_audits)
     return result
 
 
@@ -1271,6 +1602,18 @@ def _analyze_taint_file(
             )
         )
     else:
+        if any(
+            class_def.name.casefold() == "query"
+            and any(
+                method.name.casefold() == "build" and not method.parameters
+                for method in class_def.methods
+            )
+            for class_def in program.classes
+        ):
+            result.query_build_available = True
+        result.recognized_audits.extend(
+            _allowlisted_query_build_audits(program, relative_file)
+        )
         entry_points = discover_wordpress_entrypoints(program)
         functions = _program_functions(program)
         framework_auth = _framework_authorization_evidence(

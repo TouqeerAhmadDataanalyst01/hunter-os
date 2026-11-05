@@ -28,6 +28,13 @@ _TARGET_PATTERN = re.compile(
     r"|(?P<static>\\?[A-Za-z_][A-Za-z0-9_]*(?:\\[A-Za-z_][A-Za-z0-9_]*)*"
     r"::\$[A-Za-z_][A-Za-z0-9_]*)(?:\s*\[[^\]]*\])*"
 )
+_OBJECT_RECEIVER_PATTERN = re.compile(
+    r"(?P<receiver>\$[A-Za-z_][A-Za-z0-9_]*(?:->[\w]+)*)"
+    r"->(?P<method>[A-Za-z_][A-Za-z0-9_]*)$"
+)
+_OBJECT_PROPERTY_PATTERN = re.compile(
+    r"\$[A-Za-z_][A-Za-z0-9_]*(?:->[\w]+)+"
+)
 
 
 @dataclass(frozen=True)
@@ -437,6 +444,8 @@ class _Analyzer:
         arguments: list[set[_TaintedValue]],
         call_location: SourceLocation,
         depth: int,
+        receiver_name: str | None = None,
+        caller_environment: dict[str, set[_TaintedValue]] | None = None,
     ) -> set[_TaintedValue]:
         if not self._tick(call_location):
             return set()
@@ -480,7 +489,18 @@ class _Analyzer:
                 },
                 call_location,
             )
+        if receiver_name is not None and caller_environment is not None:
+            receiver_prefix = receiver_name + "->"
+            for variable, values in caller_environment.items():
+                if variable.startswith(receiver_prefix):
+                    environment["$this" + variable[len(receiver_name) :]] = set(values)
         execution = self._execute(function.body, environment, depth)
+        if receiver_name is not None and caller_environment is not None:
+            for variable, values in execution.environment.items():
+                if variable.startswith("$this->"):
+                    caller_environment[
+                        receiver_name + variable[len("$this") :]
+                    ] = set(values)
         return_values: set[_TaintedValue] = set()
         for value in execution.returns:
             return_values.add(
@@ -579,9 +599,36 @@ class _Analyzer:
                 call.location,
             )
 
+        receiver_match = _OBJECT_RECEIVER_PATTERN.fullmatch(call.name)
+        receiver_name = (
+            receiver_match.group("receiver") if receiver_match is not None else None
+        )
         function = self._function_for_call(call.name)
         if function is not None:
-            return self._invoke(function, arguments, call.location, depth + 1)
+            return self._invoke(
+                function,
+                arguments,
+                call.location,
+                depth + 1,
+                receiver_name,
+                environment,
+            )
+
+        if receiver_name is not None and not arguments:
+            property_values = environment.get(receiver_name, set())
+            propagation_step = self._step("call", call.name, call.location)
+            return self._bounded_values(
+                {
+                    _TaintedValue(
+                        value.source,
+                        value.trace + (propagation_step,),
+                        value.sanitizers,
+                        value.sanitized_contexts,
+                    )
+                    for value in property_values
+                },
+                call.location,
+            )
 
         propagator = next(
             (item for item in self.propagators if _call_matches(call.name, item.name)),
@@ -644,6 +691,11 @@ class _Analyzer:
                 expression.location,
             ),
             expression.location,
+        )
+        for property_name in _OBJECT_PROPERTY_PATTERN.findall(expression.text):
+            direct_values.update(environment.get(property_name, set()))
+        direct_values = self._bounded_values(
+            direct_values, expression.location
         )
         call_values: set[_TaintedValue] = set()
         for call in top_calls:
@@ -755,11 +807,17 @@ class _Analyzer:
                     continue
                 target = target_match.group("variable") or target_match.group("static")
                 assert target is not None
+                property_match = re.match(
+                    r"(?P<property>\$[A-Za-z_][A-Za-z0-9_]*->[\w]+)",
+                    statement.target,
+                )
+                if property_match is not None:
+                    target = property_match.group("property")
                 if statement.operator != "=":
                     values.update(current.get(target, set()))
                 elif "[" in statement.target or "->" in statement.target:
                     values.update(current.get(target, set()))
-                current[target] = self._bounded_values(
+                stored_values = self._bounded_values(
                     {
                         _TaintedValue(
                             value.source,
@@ -772,6 +830,7 @@ class _Analyzer:
                     },
                     statement.location,
                 )
+                current[target] = stored_values
             elif isinstance(statement, CallStatement):
                 self._evaluate_expression(statement.expression, current, depth)
             elif isinstance(statement, OutputStatement):

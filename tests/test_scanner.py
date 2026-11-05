@@ -10,7 +10,12 @@ from contextlib import redirect_stdout
 from pathlib import Path
 from unittest.mock import patch
 
-from analyzer.wordpress import MAX_SOURCE_BYTES, scan_plugin, scan_plugin_with_summary
+from analyzer.wordpress import (
+    MAX_SOURCE_BYTES,
+    scan_plugin,
+    scan_plugin_with_summary,
+    scan_plugin_with_taint,
+)
 from analyzer.php_parser import (
     CallStatement,
     GlobalStatement,
@@ -142,6 +147,130 @@ class ScannerTests(unittest.TestCase):
             self.assertNotIn(
                 "Unauthenticated SQL Injection",
                 {finding["type"] for finding in scan_plugin(root)},
+            )
+
+    def test_taint_mode_audits_database_column_allowlist_query_builder(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            (root / "plugin.php").write_text(
+                "<?php class RestAPI {\n"
+                "  protected function sanitizeFieldNames($fields, $table) {\n"
+                "    global $wpdb;\n"
+                "    $whitelist = $wpdb->get_col(\"SHOW COLUMNS FROM $table\");\n"
+                "    $result = array();\n"
+                "    foreach ($fields as $name) {\n"
+                "      if (array_search($name, $whitelist) !== false) "
+                "{ $result[] = $name; }\n"
+                "    }\n"
+                "    return $result;\n"
+                "  }\n"
+                "  public function markers() {\n"
+                "    $fields = $_GET['fields'];\n"
+                "    $fields = $this->sanitizeFieldNames($fields, 'markers');\n"
+                "    $query = new Query();\n"
+                "    $query->fields = $fields;\n"
+                "    $sql = $query->build();\n"
+                "    global $wpdb;\n"
+                "    $wpdb->get_results($sql);\n"
+                "  }\n"
+                "}\n",
+                encoding="utf-8",
+            )
+            (root / "query.php").write_text(
+                "<?php class Query { public $fields; "
+                "public function build(){ return $this->fields; } }",
+                encoding="utf-8",
+            )
+
+            summary = scan_plugin_with_taint(root)
+
+            self.assertFalse(
+                any(
+                    finding.get("context") == "sql"
+                    and finding.get("status") != "DOWNGRADED"
+                    for finding in summary.findings
+                )
+            )
+            self.assertTrue(
+                any(
+                    audit.get("reason") == "allowlist fix recognized"
+                    and audit.get("finding", {}).get("type") == "SQL Injection"
+                    for audit in summary.audit
+                ),
+                summary.audit,
+            )
+
+    def test_taint_mode_still_flags_unallowlisted_query_builder_input(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            (root / "plugin.php").write_text(
+                "<?php function markers(){ global $wpdb; "
+                "$fields = $_GET['fields']; "
+                "$wpdb->get_results($wpdb->prepare("
+                "\"SELECT $fields FROM markers\")); }",
+                encoding="utf-8",
+            )
+
+            summary = scan_plugin_with_taint(root)
+
+            self.assertTrue(
+                any(
+                    finding.get("context") == "sql"
+                    and finding.get("status") != "DOWNGRADED"
+                    for finding in summary.findings
+                ),
+                summary.findings,
+            )
+
+    def test_taint_mode_does_not_reuse_allowlist_from_another_class(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            (root / "plugin.php").write_text(
+                "<?php class SafeHelper {\n"
+                "  function sanitizeFieldNames($fields) {\n"
+                "    global $wpdb;\n"
+                "    $whitelist = $wpdb->get_col('SHOW COLUMNS FROM markers');\n"
+                "    $result = array();\n"
+                "    foreach ($fields as $name) {\n"
+                "      if (array_search($name, $whitelist) !== false) "
+                "{ $result[] = $name; }\n"
+                "    }\n"
+                "    return $result;\n"
+                "  }\n"
+                "}\n"
+                "class RestAPI {\n"
+                "  function sanitizeFieldNames($fields) { return $fields; }\n"
+                "  function markers() {\n"
+                "    $fields = $_GET['fields'];\n"
+                "    $fields = $this->sanitizeFieldNames($fields);\n"
+                "    $query = new Query();\n"
+                "    $query->fields = $fields;\n"
+                "    $sql = $query->build();\n"
+                "    global $wpdb;\n"
+                "    $wpdb->get_results($sql);\n"
+                "  }\n"
+                "}\n"
+                "class Query { public $fields; "
+                "function build(){ return $this->fields; } }\n",
+                encoding="utf-8",
+            )
+
+            summary = scan_plugin_with_taint(root)
+
+            self.assertFalse(
+                any(
+                    audit.get("reason") == "allowlist fix recognized"
+                    for audit in summary.audit
+                ),
+                summary.audit,
+            )
+            self.assertTrue(
+                any(
+                    finding.get("context") == "sql"
+                    and finding.get("status") != "DOWNGRADED"
+                    for finding in summary.findings
+                ),
+                summary.findings,
             )
 
     def test_cookie_comparison_can_span_lines(self) -> None:
@@ -667,6 +796,20 @@ class TaintAnalysisTests(unittest.TestCase):
         self.assertTrue(result.complete, result.diagnostics)
         self.assertEqual(len(result.flows), 1)
         self.assertEqual(result.flows[0].source.name, "$_GET")
+
+    def test_taint_tracks_object_property_through_no_argument_method_return(self) -> None:
+        result = self.analyze(
+            "<?php class Builder { public $field; "
+            "public function build(){ return $this->field; } } "
+            "function route(){ $builder = new Builder(); "
+            "$builder->field = $_GET['field']; "
+            "$query = $builder->build(); consume($query); }"
+        )
+
+        self.assertTrue(result.complete, result.diagnostics)
+        self.assertEqual(len(result.flows), 1)
+        self.assertEqual(result.flows[0].source.name, "$_GET")
+        self.assertEqual(result.flows[0].sink.name, "consume")
 
     def test_apply_filters_only_propagates_its_filtered_value(self) -> None:
         result = analyze_program(

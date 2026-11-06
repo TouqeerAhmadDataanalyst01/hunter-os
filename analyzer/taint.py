@@ -35,6 +35,17 @@ _OBJECT_RECEIVER_PATTERN = re.compile(
 _OBJECT_PROPERTY_PATTERN = re.compile(
     r"\$[A-Za-z_][A-Za-z0-9_]*(?:->[\w]+)+"
 )
+_SCRIPT_CONTEXT_PATTERN = re.compile(r"<\s*script\b", re.IGNORECASE)
+_URL_ATTRIBUTE_PATTERN = re.compile(
+    r"\b(?:href|src|action|formaction|xlink:href)\s*=\s*['\"]?",
+    re.IGNORECASE,
+)
+_SCRIPT_ATTRIBUTE_PATTERN = re.compile(r"\bon[a-z0-9_:-]*\s*=\s*['\"]?", re.IGNORECASE)
+_STYLE_ATTRIBUTE_PATTERN = re.compile(r"\bstyle\s*=\s*['\"]?", re.IGNORECASE)
+_HTML_ATTRIBUTE_PATTERN = re.compile(
+    r"<[A-Za-z][^>]*\b[A-Za-z_:][-A-Za-z0-9_:.]*\s*=\s*['\"]?",
+    re.IGNORECASE,
+)
 
 
 @dataclass(frozen=True)
@@ -193,7 +204,7 @@ DEFAULT_SANITIZERS = (
     SanitizerSpec("wp_kses", frozenset({"html"})),
     SanitizerSpec("wp_kses_post", frozenset({"html"})),
     SanitizerSpec("$wpdb->prepare", frozenset({"sql"})),
-    SanitizerSpec("esc_sql", frozenset({"sql"})),
+    SanitizerSpec("esc_sql", frozenset({"sql_value"})),
     SanitizerSpec("intval", frozenset({"sql", "html", "html_attribute"})),
     SanitizerSpec("absint", frozenset({"sql", "html", "html_attribute"})),
     SanitizerSpec("sanitize_file_name", frozenset({"filename"})),
@@ -238,6 +249,20 @@ def _call_matches(call_name: str, registered_name: str) -> bool:
     return call_name.endswith(f"->{registered_name}") or unqualified_name.endswith(
         f"::{registered_name}"
     )
+
+
+def _output_context(expression: str) -> str:
+    if _SCRIPT_CONTEXT_PATTERN.search(expression):
+        return "javascript"
+    if _URL_ATTRIBUTE_PATTERN.search(expression):
+        return "url"
+    if _SCRIPT_ATTRIBUTE_PATTERN.search(expression):
+        return "javascript"
+    if _STYLE_ATTRIBUTE_PATTERN.search(expression):
+        return "css"
+    if _HTML_ATTRIBUTE_PATTERN.search(expression):
+        return "html_attribute"
+    return "html"
 
 
 def _sanitizer_is_effective(sanitizer: SanitizerSpec, call: Call) -> bool:
@@ -1050,6 +1075,11 @@ class _Analyzer:
             sanitizer_step = self._step(
                 "sanitizer", sanitizer.name, call.location, sanitizer.contexts
             )
+            sanitizer_values = (
+                call_values
+                if sanitizer.name.casefold() == "$wpdb->prepare"
+                else arguments[0] if arguments else set()
+            )
             return self._bounded_values(
                 {
                     _TaintedValue(
@@ -1058,7 +1088,7 @@ class _Analyzer:
                         value.sanitizers + (sanitizer_step,),
                         value.sanitized_contexts | sanitizer.contexts,
                     )
-                    for value in call_values
+                    for value in sanitizer_values
                 },
                 call.location,
             )
@@ -1352,9 +1382,23 @@ class _Analyzer:
             elif isinstance(statement, OutputStatement):
                 for expression in statement.expressions:
                     values = self._evaluate_expression(expression, current, depth)
+                    context = _output_context(expression.text)
+                    if context == "html":
+                        expression_end = (
+                            expression.location.offset + len(expression.text)
+                        )
+                        sanitizer_is_inline = any(
+                            expression.location.offset
+                            <= sanitizer.location.offset
+                            < expression_end
+                            for value in values
+                            for sanitizer in value.sanitizers
+                        )
+                        if any(value.sanitizers for value in values) and not sanitizer_is_inline:
+                            context = "unknown_output"
                     self._record_sink_values(
                         statement.kind,
-                        "html",
+                        context,
                         statement.location,
                         values,
                     )

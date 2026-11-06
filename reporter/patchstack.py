@@ -210,10 +210,12 @@ def append_v5_report(
     findings: list[dict[str, object]],
     audit: list[dict[str, object]],
     reports_dir: Path = DEFAULT_REPORTS_DIR,
+    *,
+    coverage: dict[str, object] | None = None,
 ) -> Path | None:
     """Append V5 taint evidence without changing legacy V4-only report bytes."""
     safe_slug = _safe_slug(slug)
-    if not findings and not audit:
+    if not findings and not audit and coverage is None:
         return None
 
     report_directory = reports_dir / safe_slug
@@ -293,6 +295,57 @@ def append_v5_report(
             if item.get("note"):
                 lines.extend(["", f"**Judge note:** {_markdown_text(item['note'])}"])
             lines.append("")
+
+    if coverage is not None:
+        totals = coverage.get("php_files_by_status", {})
+        classes = coverage.get("php_files_by_classification", {})
+        reasons = coverage.get("incomplete_reasons", [])
+        exclusions = coverage.get("intentional_exclusions", [])
+        lines.extend([
+            "## V5 Coverage",
+            "",
+            f"**Coverage complete:** {'yes' if coverage.get('complete') else 'no'}",
+            f"**Discovered PHP files:** {coverage.get('discovered_php_files', 0)}",
+        ])
+        if isinstance(totals, dict):
+            lines.append(
+                "**PHP file statuses:** "
+                + ", ".join(
+                    f"{_markdown_text(status)}: {count}"
+                    for status, count in sorted(totals.items())
+                )
+            )
+        if isinstance(classes, dict):
+            lines.append(
+                "**PHP file classifications:** "
+                + ", ".join(
+                    f"{_markdown_text(classification)}: {count}"
+                    for classification, count in sorted(classes.items())
+                )
+            )
+        lines.append("")
+        if isinstance(reasons, list) and reasons:
+            lines.extend(["**Coverage gaps:**", ""])
+            for reason in reasons:
+                if isinstance(reason, dict):
+                    lines.append(
+                        f"- {_markdown_code(reason.get('path', '<unknown>'))}: "
+                        f"{_markdown_text(reason.get('status', 'skipped'))} - "
+                        f"{_markdown_text(reason.get('reason', 'No reason recorded'))}"
+                    )
+            lines.append("")
+        if isinstance(exclusions, list) and exclusions:
+            lines.extend(["**Intentionally excluded PHP files:**", ""])
+            for exclusion in exclusions:
+                if isinstance(exclusion, dict):
+                    lines.append(
+                        f"- {_markdown_code(exclusion.get('path', '<unknown>'))}: "
+                        f"{_markdown_text(exclusion.get('classification', 'excluded'))} - "
+                        f"{_markdown_text(exclusion.get('reason', 'No reason recorded'))}"
+                    )
+            lines.append("")
+        if coverage.get("complete"):
+            lines.extend(["All in-scope discovered PHP files were analyzed.", ""])
 
     section = "\n".join(lines).rstrip() + "\n"
     existing = (

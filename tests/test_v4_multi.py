@@ -17,7 +17,7 @@ from analyzer.platform import detect_platform
 from analyzer.taint import TaintSink
 from analyzer.wordpress import scan_plugin, scan_plugin_with_taint
 from duplicate_checker import is_duplicate, record_finding
-from main import main, scan_source_path, scan_target
+from main import _coverage_after_timeout, main, scan_source_path, scan_target
 from reporter.json_report import write_json_report
 from reporter.patchstack import append_v5_report
 
@@ -100,6 +100,43 @@ class ExistingWordPressFilterTests(unittest.TestCase):
 
 
 class TaintScannerModeTests(unittest.TestCase):
+    def test_timeout_coverage_marks_unconfirmed_files_skipped(self) -> None:
+        coverage = {
+            "complete": True,
+            "discovered_php_files": 2,
+            "php_files_by_status": {"scanned": 2},
+            "php_files_by_classification": {"first_party": 2},
+            "files": [
+                {
+                    "kind": "php_file",
+                    "path": "one.php",
+                    "status": "scanned",
+                    "classification": "first_party",
+                    "reason": "",
+                },
+                {
+                    "kind": "php_file",
+                    "path": "vendor/lib.php",
+                    "status": "intentionally_excluded",
+                    "classification": "third_party",
+                    "reason": "classified as third-party dependency code",
+                },
+            ],
+            "non_file_issues": [],
+            "incomplete_reasons": [],
+            "intentional_exclusions": [],
+        }
+
+        result = _coverage_after_timeout(coverage, "analysis timed out")
+
+        self.assertFalse(result["complete"])
+        self.assertEqual(
+            result["php_files_by_status"],
+            {"skipped": 1, "intentionally_excluded": 1},
+        )
+        self.assertEqual(result["files"][0]["reason"], "analysis timed out")
+        self.assertEqual(result["incomplete_reasons"][0]["path"], "one.php")
+
     def test_v5_markdown_escapes_untrusted_text_and_deduplicates_sections(self) -> None:
         with tempfile.TemporaryDirectory() as temporary_directory:
             reports = Path(temporary_directory)
@@ -183,6 +220,11 @@ class TaintScannerModeTests(unittest.TestCase):
             self.assertEqual(result.exit_code, 1)
             self.assertEqual(len(json_report["v5_taint_findings"]), 1)
             self.assertEqual(len(json_report["v5_audit"]), 1)
+            self.assertTrue(json_report["v5_coverage"]["complete"])
+            self.assertEqual(json_report["v5_coverage"]["discovered_php_files"], 1)
+            self.assertEqual(
+                json_report["v5_coverage"]["php_files_by_status"], {"scanned": 1}
+            )
             self.assertIn("## V5 Taint Analysis", markdown)
             self.assertIn("Cross-Site Scripting (XSS)", markdown)
             self.assertIn("$_GET", markdown)
@@ -197,6 +239,9 @@ class TaintScannerModeTests(unittest.TestCase):
             self.assertIn("## V5 Audit (`v5_audit`)", markdown)
             self.assertIn("effective sanitizer", markdown)
             self.assertIn("function `safe`", markdown)
+            self.assertIn("## V5 Coverage", markdown)
+            self.assertIn("**Coverage complete:** yes", markdown)
+            self.assertIn("**PHP file statuses:** scanned: 1", markdown)
 
     def test_mass_folder_scan_adds_taint_fields_and_preserves_history_dedupe(self) -> None:
         with tempfile.TemporaryDirectory() as temporary_directory:
@@ -210,6 +255,11 @@ class TaintScannerModeTests(unittest.TestCase):
             (source / "includes").mkdir()
             (source / "includes" / "two.php").write_text(
                 "<?php function run_query(){ $wpdb->query($_POST['sql']); }",
+                encoding="utf-8",
+            )
+            (source / "vendor" / "library").mkdir(parents=True)
+            (source / "vendor" / "library" / "ignored.php").write_text(
+                "<?php echo $_GET['vendor'];",
                 encoding="utf-8",
             )
             reports = root / "reports"
@@ -232,6 +282,22 @@ class TaintScannerModeTests(unittest.TestCase):
                 {"Unauthenticated SQL Injection"},
             )
             self.assertEqual(len(first_report["v5_taint_findings"]), 2)
+            coverage = first_report["v5_coverage"]
+            self.assertTrue(coverage["complete"])
+            self.assertEqual(coverage["discovered_php_files"], 3)
+            self.assertEqual(
+                coverage["php_files_by_status"],
+                {"intentionally_excluded": 1, "scanned": 2},
+            )
+            self.assertEqual(
+                coverage["intentional_exclusions"][0]["path"],
+                "vendor/library/ignored.php",
+            )
+            markdown = (
+                reports / "mass-plugin" / "report_patchstack.md"
+            ).read_text(encoding="utf-8")
+            self.assertIn("Intentionally excluded PHP files", markdown)
+            self.assertIn("vendor/library/ignored.php", markdown)
             self.assertEqual((reports / "history.json").read_bytes(), history)
 
     def test_mass_zip_scan_uses_safe_extraction_and_v4_regex_shape(self) -> None:
@@ -292,6 +358,9 @@ class TaintScannerModeTests(unittest.TestCase):
                     encoding="utf-8"
                 )
             )
+            markdown = (
+                root / "reports" / "bounded" / "report_patchstack.md"
+            ).read_text(encoding="utf-8")
             self.assertEqual(result.exit_code, 1)
             self.assertTrue(any(
                 finding["type"] == "Incomplete taint analysis"
@@ -311,6 +380,19 @@ class TaintScannerModeTests(unittest.TestCase):
                 warning_files,
                 {"empty.php", "broken.php", "large.php"},
             )
+            self.assertFalse(report["v5_coverage"]["complete"])
+            self.assertEqual(
+                report["v5_coverage"]["php_files_by_status"],
+                {"oversized": 1, "unsupported": 2},
+            )
+            self.assertEqual(
+                {item["path"] for item in report["v5_coverage"]["incomplete_reasons"]},
+                {"empty.php", "broken.php", "large.php"},
+            )
+            self.assertIn("**Coverage complete:** no", markdown)
+            self.assertIn("**Coverage gaps:**", markdown)
+            self.assertIn("empty.php", markdown)
+            self.assertIn("source limit", markdown)
 
     def test_taint_mass_scan_surfaces_timeout_and_file_count_limits(self) -> None:
         with tempfile.TemporaryDirectory() as temporary_directory:
@@ -514,6 +596,237 @@ class TaintScannerModeTests(unittest.TestCase):
             self.assertEqual(
                 {item["entry_point_details"]["route"] for item in routes}, {"/open"}
             )
+
+    def test_closure_body_is_never_reported_as_clean_when_not_analyzed(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            source = Path(temporary_directory) / "closure.php"
+            source.write_text(
+                "<?php $callback = function(){ echo $_GET['value']; };",
+                encoding="utf-8",
+            )
+
+            completed = subprocess.run(
+                [
+                    sys.executable,
+                    str(Path(__file__).resolve().parents[1] / "main.py"),
+                    "--engine=taint",
+                    str(source),
+                ],
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+
+            self.assertEqual(completed.returncode, 1, completed.stderr)
+            report = json.loads(completed.stdout)
+            incomplete = [
+                item for item in report["v5_taint_findings"]
+                if item["type"] == "Incomplete taint analysis"
+            ]
+            self.assertEqual(len(incomplete), 1)
+            self.assertEqual(incomplete[0]["confidence"], "low")
+            self.assertIn("closure", incomplete[0]["note"].casefold())
+            self.assertTrue(any(
+                item["finding"]["type"] == "Incomplete taint analysis"
+                for item in report["v5_audit"]
+            ))
+
+    def test_ajax_authorization_checks_each_sensitive_operation(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            source = Path(temporary_directory) / "ajax.php"
+            source.write_text(
+                "<?php\n"
+                "add_action('wp_ajax_nopriv_delete', 'handle_delete');\n"
+                "function handle_delete(){\n"
+                "  if (current_user_can('delete_posts')) wp_delete_post(1);\n"
+                "  wp_delete_user($_POST['id']);\n"
+                "}\n",
+                encoding="utf-8",
+            )
+
+            completed = subprocess.run(
+                [
+                    sys.executable,
+                    str(Path(__file__).resolve().parents[1] / "main.py"),
+                    "--engine=taint",
+                    str(source),
+                ],
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+
+            self.assertEqual(completed.returncode, 1, completed.stderr)
+            report = json.loads(completed.stdout)
+            ajax_findings = [
+                item for item in report["v5_taint_findings"]
+                if item["type"] == "Unauthenticated WordPress AJAX Action"
+            ]
+            self.assertEqual(len(ajax_findings), 1)
+            self.assertEqual(ajax_findings[0]["sink"]["name"], "wp_delete_user")
+            self.assertEqual(ajax_findings[0]["line"], 5)
+            self.assertFalse(ajax_findings[0]["auth_evidence"])
+            protected = [
+                item["finding"] for item in report["v5_audit"]
+                if item.get("finding", {}).get("type")
+                == "Unauthenticated WordPress AJAX Action"
+            ]
+            self.assertEqual(len(protected), 1)
+            self.assertEqual(protected[0]["sink"]["name"], "wp_delete_post")
+            self.assertTrue(protected[0]["auth_evidence"])
+
+    def test_rest_permission_requires_authorization_on_every_path(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            source = root / "routes.php"
+            source.write_text(
+                "<?php\n"
+                "register_rest_route('demo/v1', '/conditional', ["
+                "'callback' => 'delete_conditional', 'permission_callback' => 'maybe_delete']);\n"
+                "register_rest_route('demo/v1', '/protected', ["
+                "'callback' => 'delete_protected', 'permission_callback' => 'can_delete']);\n"
+                "function maybe_delete(){\n"
+                "  if ($_GET['check']) return current_user_can('delete_posts');\n"
+                "  return true;\n"
+                "}\n"
+                "function can_delete(){ return current_user_can('delete_posts'); }\n"
+                "function delete_conditional($request){ wp_delete_post($request['id']); }\n"
+                "function delete_protected($request){ wp_delete_post($request['id']); }\n",
+                encoding="utf-8",
+            )
+
+            completed = subprocess.run(
+                [
+                    sys.executable,
+                    str(Path(__file__).resolve().parents[1] / "main.py"),
+                    "--engine=taint",
+                    str(source),
+                ],
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+
+            self.assertEqual(completed.returncode, 1, completed.stderr)
+            report = json.loads(completed.stdout)
+            rest_findings = [
+                item for item in report["v5_taint_findings"]
+                if item["type"] == "WordPress REST Route Authorization"
+            ]
+            self.assertEqual(
+                {item["entry_point_details"]["route"] for item in rest_findings},
+                {"/conditional"},
+            )
+            finding = rest_findings[0]
+            self.assertEqual(finding["sink"]["name"], "wp_delete_post")
+            self.assertFalse(finding["auth_evidence"])
+            protected_action = [
+                item["finding"] for item in report["v5_audit"]
+                if item.get("finding", {}).get("function") == "delete_protected"
+                and item.get("finding", {}).get("type")
+                == "Sensitive State-Changing Action"
+            ]
+            self.assertTrue(any(item["auth_evidence"] for item in protected_action))
+
+    def test_sanitizer_argument_and_context_proofs_are_sink_specific(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            source = Path(temporary_directory) / "contexts.php"
+            source.write_text(
+                "<?php\n"
+                "function output(){\n"
+                "  echo esc_html($_GET['safe']);\n"
+                "  echo '<script>const x=\"' . esc_html($_GET['js']) . '\";</script>';\n"
+                "  echo '<a href=\"' . esc_html($_GET['bad_url']) . '\">';\n"
+                "  echo '<a href=\"' . esc_url($_GET['safe_url']) . '\">';\n"
+                "  echo '<div title=\"' . esc_html($_GET['bad_attr']) . '\">';\n"
+                "  echo '<div title=\"' . esc_attr($_GET['safe_attr']) . '\">';\n"
+                "  echo '<button onclick=\"' . esc_attr($_GET['event']) . '\">';\n"
+                "  echo '<div style=\"' . esc_attr($_GET['style']) . '\">';\n"
+                "  $safe_unlocated = esc_html($_GET['unknown_context']);\n"
+                "  echo $safe_unlocated;\n"
+                "  echo esc_html('constant', $_GET['unused']);\n"
+                "}\n"
+                "function query(){\n"
+                "  $wpdb->query('SELECT * FROM t ORDER BY ' . esc_sql($_GET['sort']));\n"
+                "  $wpdb->query($wpdb->prepare('SELECT * FROM t WHERE id=%d', $_GET['id']));\n"
+                "}\n",
+                encoding="utf-8",
+            )
+
+            completed = subprocess.run(
+                [
+                    sys.executable,
+                    str(Path(__file__).resolve().parents[1] / "main.py"),
+                    "--engine=taint",
+                    str(source),
+                ],
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+
+            self.assertEqual(completed.returncode, 1, completed.stderr)
+            report = json.loads(completed.stdout)
+            active = report["v5_taint_findings"]
+            xss_active = [
+                item for item in active
+                if item["type"] == "Cross-Site Scripting (XSS)"
+            ]
+            self.assertEqual(len(xss_active), 6)
+            self.assertEqual(
+                {item["context"] for item in xss_active},
+                {"javascript", "url", "html_attribute", "unknown_output", "css"},
+            )
+            self.assertTrue(all(
+                item["sanitizer_evidence"]
+                and not item["sanitizer_evidence"][0]["effective"]
+                for item in xss_active
+            ))
+            sql = [
+                item for item in active if item["type"] == "SQL Injection"
+            ]
+            self.assertEqual(len(sql), 1)
+            self.assertTrue(sql[0]["sanitizer_evidence"])
+            self.assertFalse(sql[0]["sanitizer_evidence"][0]["effective"])
+            audit_findings = [
+                item["finding"] for item in report["v5_audit"]
+                if isinstance(item.get("finding"), dict)
+            ]
+            self.assertTrue(any(
+                item["type"] == "Cross-Site Scripting (XSS)"
+                and item["context"] == "html"
+                and item["status"] == "DOWNGRADED"
+                for item in audit_findings
+            ))
+            self.assertTrue(any(
+                item["type"] == "Cross-Site Scripting (XSS)"
+                and item["context"] == "url"
+                and item["status"] == "DOWNGRADED"
+                and any(
+                    evidence["name"] == "esc_url" and evidence["effective"]
+                    for evidence in item["sanitizer_evidence"]
+                )
+                for item in audit_findings
+            ))
+            self.assertTrue(any(
+                item["type"] == "Cross-Site Scripting (XSS)"
+                and item["context"] == "html_attribute"
+                and item["status"] == "DOWNGRADED"
+                and any(
+                    evidence["name"] == "esc_attr" and evidence["effective"]
+                    for evidence in item["sanitizer_evidence"]
+                )
+                for item in audit_findings
+            ))
+            self.assertTrue(any(
+                item["type"] == "SQL Injection"
+                and item["status"] == "DOWNGRADED"
+                and any(
+                    evidence["name"] == "$wpdb->prepare" and evidence["effective"]
+                    for evidence in item["sanitizer_evidence"]
+                )
+                for item in audit_findings
+            ))
 
     def test_real_file_cli_reports_only_unsanitized_xss(self) -> None:
         with tempfile.TemporaryDirectory() as temporary_directory:

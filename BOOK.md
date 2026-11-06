@@ -301,6 +301,8 @@ python main.py --engine=taint /path/to/plugin.php
 
 Folder/ZIP mass scans are capped at 10,000 PHP files. `--timeout` bounds taint work cooperatively between file analyses; it does not forcibly interrupt a file already being analyzed.
 
+Taint reports include a PHP file inventory in JSON (`v5_coverage`) and a Markdown coverage section. Every discovered PHP file has a disposition: `scanned`, `intentionally_excluded`, `unsupported`, `oversized`, `unreadable`, or `skipped`, with a reason where applicable. Third-party dependencies, tests, generated output, and repository metadata are classified explicitly. Unsupported, oversized, unreadable, skipped files, and directory-enumeration failures make V5 coverage incomplete; a taint scan with incomplete coverage is not a clean result.
+
 The CLI returns `0` for a clean scan/dry-run, `1` when matches exist, `2` for missing or invalid target/source/archive configuration, `3` for ambiguous or unsupported platform handling, and `4` for internal source-directory or eligible-file listing errors.
 
 Inspect reports and history:

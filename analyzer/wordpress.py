@@ -41,7 +41,6 @@ from analyzer.taint import (
 
 
 IGNORE_DIRS = {"vendor", "node_modules", "dist", ".git", "__pycache__", "tests", "test"}
-PRIMARY_DIRECTORIES = {"includes", "admin", "public"}
 AUTH_CHECK_PATTERN = re.compile(
     r"current_user_can|check_ajax_referer|check_admin_referer|"
     r"wp_verify_nonce|is_user_logged_in|permission_callback",
@@ -71,6 +70,7 @@ class ScanSummary:
     findings: list[dict[str, object]] = field(default_factory=list)
     scanned_files: int = 0
     skipped: list[dict[str, str]] = field(default_factory=list)
+    coverage: dict[str, object] = field(default_factory=dict)
 
 
 @dataclass
@@ -81,6 +81,176 @@ class TaintScanSummary:
     diagnostics: list[dict[str, object]] = field(default_factory=list)
     query_build_available: bool = False
     complete: bool = True
+    coverage: dict[str, object] = field(default_factory=dict)
+
+
+def _file_classification(relative_parts: tuple[str, ...]) -> str:
+    components = {part.casefold() for part in relative_parts[:-1]}
+    if components.intersection({"vendor", "node_modules"}):
+        return "third_party"
+    if components.intersection({"dist", ".git", "__pycache__"}):
+        return "generated_or_repository"
+    if components.intersection({"build", "generated", "cache"}) or relative_parts[
+        -1
+    ].casefold().endswith(".min.php"):
+        return "generated"
+    if components.intersection({"tests", "test"}):
+        return "test"
+    return "first_party"
+
+
+def _coverage_report(entries: list[dict[str, str]]) -> dict[str, object]:
+    php_entries = [entry for entry in entries if entry.get("kind") == "php_file"]
+    status_totals: dict[str, int] = {}
+    classification_totals: dict[str, int] = {}
+    for entry in php_entries:
+        status = entry["status"]
+        classification = entry["classification"]
+        status_totals[status] = status_totals.get(status, 0) + 1
+        classification_totals[classification] = (
+            classification_totals.get(classification, 0) + 1
+        )
+    incomplete_statuses = {"unsupported", "oversized", "unreadable", "skipped"}
+    incomplete_records = [
+        entry
+        for entry in entries
+        if entry["status"] in incomplete_statuses
+    ]
+    return {
+        "complete": not incomplete_records,
+        "discovered_php_files": len(php_entries),
+        "php_files_by_status": status_totals,
+        "php_files_by_classification": classification_totals,
+        "non_file_issues": [
+            entry for entry in entries if entry.get("kind") != "php_file"
+        ],
+        "incomplete_reasons": [
+            {
+                "path": entry["path"],
+                "status": entry["status"],
+                "reason": entry["reason"],
+            }
+            for entry in incomplete_records
+        ],
+        "intentional_exclusions": [
+            {
+                "path": entry["path"],
+                "classification": entry["classification"],
+                "reason": entry["reason"],
+            }
+            for entry in php_entries
+            if entry["status"] == "intentionally_excluded"
+        ],
+        "files": php_entries,
+    }
+
+
+def _discover_php_files(
+    root: Path,
+) -> tuple[list[Path], list[dict[str, str]]]:
+    """Inventory all PHP files while retaining exclusions and walk failures."""
+    candidates: list[Path] = []
+    entries: list[dict[str, str]] = []
+    walk_errors: list[OSError] = []
+
+    def record_walk_error(error: OSError) -> None:
+        walk_errors.append(error)
+
+    for current, directories, filenames in os.walk(
+        root, topdown=True, followlinks=False, onerror=record_walk_error
+    ):
+        current_path = Path(current)
+        retained_directories: list[str] = []
+        for directory in sorted(directories):
+            directory_path = current_path / directory
+            relative = directory_path.relative_to(root).as_posix()
+            if directory_path.is_symlink():
+                entries.append(
+                    {
+                        "kind": "directory",
+                        "path": relative,
+                        "status": "skipped",
+                        "classification": _file_classification(
+                            directory_path.relative_to(root).parts + ("placeholder.php",)
+                        ),
+                        "reason": "symbolic-link directory; contents were not enumerated",
+                    }
+                )
+            else:
+                retained_directories.append(directory)
+        directories[:] = retained_directories
+
+        for filename in sorted(filenames):
+            source_file = current_path / filename
+            if source_file.suffix.casefold() != ".php":
+                continue
+            relative_parts = source_file.relative_to(root).parts
+            relative = source_file.relative_to(root).as_posix()
+            classification = _file_classification(relative_parts)
+            if source_file.is_symlink():
+                entries.append(
+                    {
+                        "kind": "php_file",
+                        "path": relative,
+                        "status": "skipped",
+                        "classification": classification,
+                        "reason": "symbolic-link PHP file was not followed",
+                    }
+                )
+            elif classification not in {"first_party", "generated"}:
+                excluded_reason = next(
+                    (
+                        f"inside intentionally excluded {part} directory"
+                        for part in relative_parts[:-1]
+                        if part.casefold() in IGNORE_DIRS
+                    ),
+                    {
+                        "third_party": "classified as third-party dependency code",
+                        "generated": "classified as generated code",
+                        "generated_or_repository": (
+                            "inside generated output or repository metadata"
+                        ),
+                        "test": "classified as test code",
+                    }.get(classification, "intentionally excluded by classification"),
+                )
+                entries.append(
+                    {
+                        "kind": "php_file",
+                        "path": relative,
+                        "status": "intentionally_excluded",
+                        "classification": classification,
+                        "reason": excluded_reason,
+                    }
+                )
+            else:
+                candidates.append(source_file)
+                entries.append(
+                    {
+                        "kind": "php_file",
+                        "path": relative,
+                        "status": "pending",
+                        "classification": classification,
+                        "reason": "",
+                    }
+                )
+
+    for error in walk_errors:
+        try:
+            relative = Path(error.filename or root).relative_to(root).as_posix()
+        except ValueError:
+            relative = str(error.filename or root)
+        entries.append(
+            {
+                "kind": "directory",
+                "path": relative,
+                "status": "skipped",
+                "classification": "unknown",
+                "reason": f"directory could not be enumerated: {error}",
+            }
+        )
+    candidates.sort()
+    entries.sort(key=lambda entry: (entry["path"], entry["kind"]))
+    return candidates, entries
 
 
 def _line_for(text: str, offset: int) -> int:
@@ -100,9 +270,7 @@ def _is_in_scan_scope(path: Path, root: Path) -> bool:
     relative_path = path.relative_to(root)
     if any(part.lower() in IGNORE_DIRS for part in relative_path.parts[:-1]):
         return False
-    if path.suffix.lower() != ".php":
-        return False
-    return len(relative_path.parts) == 1 or relative_path.parts[0].lower() in PRIMARY_DIRECTORIES
+    return path.suffix.lower() == ".php"
 
 
 def _auth_check_before(text: str, offset: int) -> str | None:
@@ -193,86 +361,83 @@ def scan_plugin_with_summary(
         raise NotADirectoryError(f"Plugin source directory not found: {root}")
 
     summary = ScanSummary()
-    walk_errors: list[OSError] = []
-
-    def record_walk_error(error: OSError) -> None:
-        walk_errors.append(error)
-
-    candidates: list[Path] = []
-    file_limit_reached = False
-    for current, directories, filenames in os.walk(
-        root, topdown=True, followlinks=False, onerror=record_walk_error
-    ):
-        current_path = Path(current)
-        retained_directories: list[str] = []
-        for directory in sorted(directories):
-            directory_path = current_path / directory
-            relative = directory_path.relative_to(root).as_posix()
-            if directory_path.is_symlink():
-                summary.skipped.append(
-                    {"path": relative, "reason": "symbolic-link directory"}
-                )
-            elif directory.lower() in IGNORE_DIRS:
-                summary.skipped.append(
-                    {"path": f"{relative}/**", "reason": "out of scan scope"}
-                )
-            elif current_path == root and directory.lower() not in PRIMARY_DIRECTORIES:
-                summary.skipped.append(
-                    {"path": f"{relative}/**", "reason": "out of scan scope"}
-                )
-            else:
-                retained_directories.append(directory)
-        directories[:] = retained_directories
-
-        for filename in sorted(filenames):
-            source_file = current_path / filename
-            relative = source_file.relative_to(root).as_posix()
-            if source_file.is_symlink():
-                summary.skipped.append(
-                    {"path": relative, "reason": "symbolic link"}
-                )
-            elif _is_in_scan_scope(source_file, root):
-                candidates.append(source_file)
-                if max_files is not None and len(candidates) > max_files:
-                    file_limit_reached = True
-                    directories[:] = []
-                    break
-            else:
-                summary.skipped.append(
-                    {"path": relative, "reason": "out of scan scope"}
-                )
-        if file_limit_reached:
-            break
-
-    for error in walk_errors:
-        try:
-            relative = Path(error.filename or root).relative_to(root).as_posix()
-        except ValueError:
-            relative = str(error.filename or root)
-        summary.skipped.append(
-            {"path": relative, "reason": "unreadable directory"}
-        )
-
-    candidates.sort()
-    if file_limit_reached:
-        summary.skipped.append(
-            {"path": "<remaining PHP files>", "reason": "file-count limit"}
-        )
+    candidates, coverage_entries = _discover_php_files(root)
+    coverage_index = _coverage_entry_index(coverage_entries)
     if max_files is not None and len(candidates) > max_files:
+        for source_file in candidates[max_files:]:
+            _set_coverage_status(
+                coverage_index,
+                source_file.relative_to(root).as_posix(),
+                "skipped",
+                "file-count limit",
+            )
         candidates = candidates[:max_files]
+
     for source_file in candidates:
+        relative = source_file.relative_to(root).as_posix()
+        try:
+            if source_file.stat().st_size > MAX_SOURCE_BYTES:
+                _set_coverage_status(
+                    coverage_index, relative, "oversized",
+                    f"exceeds {MAX_SOURCE_BYTES} byte source limit",
+                )
+                summary.skipped.append(
+                    {"path": relative, "reason": "oversized"}
+                )
+                continue
+        except OSError as error:
+            _set_coverage_status(
+                coverage_index, relative, "unreadable", str(error)
+            )
+            summary.skipped.append({"path": relative, "reason": "unreadable"})
+            continue
         findings, skip_reason = _inspect_file(source_file, root)
         if skip_reason is not None:
+            status = "oversized" if skip_reason == "oversized" else "unreadable"
+            _set_coverage_status(
+                coverage_index, relative, status, skip_reason
+            )
             summary.skipped.append(
                 {
-                    "path": source_file.relative_to(root).as_posix(),
+                    "path": relative,
                     "reason": skip_reason,
                 }
             )
             continue
+        _set_coverage_status(coverage_index, relative, "scanned", "")
         summary.scanned_files += 1
         summary.findings.extend(findings)
+    summary.coverage = _coverage_report(coverage_entries)
+    skipped_paths = {item["path"] for item in summary.skipped}
+    for issue in summary.coverage["incomplete_reasons"]:
+        if issue["path"] not in skipped_paths:
+            summary.skipped.append(
+                {"path": issue["path"], "reason": issue["reason"]}
+            )
+            skipped_paths.add(issue["path"])
     return summary
+
+
+def _coverage_entry_index(
+    entries: list[dict[str, str]],
+) -> dict[str, dict[str, str]]:
+    return {
+        entry["path"]: entry
+        for entry in entries
+        if entry.get("kind") == "php_file"
+    }
+
+
+def _set_coverage_status(
+    entry_index: dict[str, dict[str, str]],
+    path: str,
+    status: str,
+    reason: str,
+) -> None:
+    entry = entry_index.get(path)
+    if entry is not None:
+        entry["status"] = status
+        entry["reason"] = reason
 
 
 def _statement_expressions(
@@ -515,6 +680,11 @@ def _finding_from_flow(
     ]
     categories = {
         "html": "Cross-Site Scripting (XSS)",
+        "html_attribute": "Cross-Site Scripting (XSS)",
+        "javascript": "Cross-Site Scripting (XSS)",
+        "url": "Cross-Site Scripting (XSS)",
+        "css": "Cross-Site Scripting (XSS)",
+        "unknown_output": "Cross-Site Scripting (XSS)",
         "sql": "SQL Injection",
         "upload": "Unsafe File Upload",
         "file_path": "Directory Traversal / Local File Inclusion",
@@ -992,30 +1162,28 @@ def _permission_callback_proof(
     if len(candidates) != 1:
         return []
     function = candidates[0]
-    evidence: list[dict[str, object]] = []
-    for statement in _walk_statements(tuple(function.body)):
-        if not isinstance(statement, ReturnStatement) or statement.value is None:
-            continue
-        expression = statement.value
-        if (
-            len(expression.calls) == 1
-            and expression.text.strip().casefold().startswith(
-                expression.calls[0].name.casefold()
-            )
-            and expression.calls[0].name.rsplit("->", 1)[-1].rsplit("::", 1)[-1].casefold()
-            in AUTH_CALLS
-        ):
-            call = expression.calls[0]
-            evidence.append(
-                {
-                    "name": call.name,
-                    "file": relative_file,
-                    "line": call.location.line,
-                    "scope": _callback_scope_name(function),
-                    "proof": "permission callback directly returns a capability check",
-                }
-            )
-    return evidence
+    if len(function.body) != 1 or not isinstance(function.body[0], ReturnStatement):
+        return []
+    expression = function.body[0].value
+    if expression is None or len(expression.calls) != 1:
+        return []
+    call = expression.calls[0]
+    normalized_name = call.name.rsplit("->", 1)[-1].rsplit("::", 1)[-1].casefold()
+    if (
+        normalized_name not in AUTH_CALLS
+        or call.location.offset != expression.location.offset
+        or call.end_offset != expression.location.offset + len(expression.text)
+    ):
+        return []
+    return [
+        {
+            "name": call.name,
+            "file": relative_file,
+            "line": call.location.line,
+            "scope": _callback_scope_name(function),
+            "proof": "permission callback directly returns a capability check on every path",
+        }
+    ]
 
 
 def _framework_authorization_evidence(
@@ -1069,8 +1237,7 @@ def _wordpress_framework_findings(
         function_calls = _scope_calls(function_body)
         if entry_point.kind == "ajax":
             hook = entry_point.name
-            sensitive_call = next(
-                (
+            sensitive_calls = [
                     call
                     for call in function_calls
                     if call.name.rsplit("->", 1)[-1]
@@ -1084,17 +1251,9 @@ def _wordpress_framework_findings(
                         "$wpdb->get_row",
                         "$wpdb->get_var",
                     }
-                ),
-                None,
-            )
-            if sensitive_call is None:
+                ]
+            if not sensitive_calls:
                 continue
-            auth_evidence = _guard_evidence_in_scope(
-                function_body,
-                sensitive_call.location,
-                scope_name,
-                relative_file,
-            )
             nonce_evidence = [
                 {
                     "name": call.name,
@@ -1106,65 +1265,72 @@ def _wordpress_framework_findings(
                 if call.name.rsplit("->", 1)[-1].rsplit("::", 1)[-1].casefold()
                 in NONCE_CALLS
             ]
-            nonce_note = (
-                " nonce is not auth"
-                if nonce_evidence and not auth_evidence
-                else (
-                    " missing current_user_can authorization proof."
-                    if not auth_evidence
-                    else ""
+            for sensitive_call in sensitive_calls:
+                auth_evidence = _guard_evidence_in_scope(
+                    function_body,
+                    sensitive_call.location,
+                    scope_name,
+                    relative_file,
                 )
-            )
-            line = sensitive_call.location.line
-            findings.append(
-                {
-                    "file": relative_file,
-                    "line": line,
-                    "type": "Unauthenticated WordPress AJAX Action",
-                    "status": "POTENTIAL",
-                    "confidence": "medium",
-                    "context": "ajax_authorization",
-                    "function": scope_name,
-                    "source": {
-                        "name": hook,
-                        "file": relative_file,
-                        "line": entry_point.location.line,
-                    },
-                    "sink": {
-                        "name": sensitive_call.name,
+                nonce_note = (
+                    " nonce is not auth"
+                    if nonce_evidence and not auth_evidence
+                    else (
+                        " missing current_user_can authorization proof."
+                        if not auth_evidence
+                        else ""
+                    )
+                )
+                line = sensitive_call.location.line
+                findings.append(
+                    {
                         "file": relative_file,
                         "line": line,
-                    },
-                    "trace": [
-                        {
-                            "kind": "hook",
+                        "type": "Unauthenticated WordPress AJAX Action",
+                        "status": "POTENTIAL",
+                        "confidence": "medium",
+                        "context": "ajax_authorization",
+                        "function": scope_name,
+                        "source": {
                             "name": hook,
                             "file": relative_file,
                             "line": entry_point.location.line,
                         },
-                        {
-                            "kind": "callback",
-                            "name": scope_name,
-                            "file": relative_file,
-                            "line": function.location.line,
-                        },
-                        {
-                            "kind": "sensitive_operation",
+                        "sink": {
                             "name": sensitive_call.name,
                             "file": relative_file,
                             "line": line,
                         },
-                    ],
-                    "sanitizer_evidence": [],
-                    "auth_evidence": auth_evidence,
-                    "nonce_evidence": nonce_evidence,
-                    "entry_points": [_entry_point_record(entry_point)],
-                    "note": (
-                        f"WordPress AJAX callback {hook} reaches a sensitive operation."
-                        f"{nonce_note}"
-                    ),
-                }
-            )
+                        "trace": [
+                            {
+                                "kind": "hook",
+                                "name": hook,
+                                "file": relative_file,
+                                "line": entry_point.location.line,
+                            },
+                            {
+                                "kind": "callback",
+                                "name": scope_name,
+                                "file": relative_file,
+                                "line": function.location.line,
+                            },
+                            {
+                                "kind": "sensitive_operation",
+                                "name": sensitive_call.name,
+                                "file": relative_file,
+                                "line": line,
+                            },
+                        ],
+                        "sanitizer_evidence": [],
+                        "auth_evidence": auth_evidence,
+                        "nonce_evidence": nonce_evidence,
+                        "entry_points": [_entry_point_record(entry_point)],
+                        "note": (
+                            f"WordPress AJAX callback {hook} reaches a sensitive operation."
+                            f"{nonce_note}"
+                        ),
+                    }
+                )
             continue
 
         route_flows = [
@@ -1452,18 +1618,20 @@ def scan_plugin_with_taint(
         raise ValueError("File limit must be positive")
     if timeout_seconds is not None and timeout_seconds < 1:
         raise ValueError("Timeout must be positive")
-    candidates = [
-        source_file
-        for source_file in list_scan_files(
-            root, max_files=max_files + 1 if max_files is not None else None
-        )
-        if not source_file.is_symlink()
-    ]
-    over_file_limit = max_files is not None and len(candidates) > max_files
-    if over_file_limit:
+    candidates, coverage_entries = _discover_php_files(root)
+    coverage_index = _coverage_entry_index(coverage_entries)
+    if max_files is not None and len(candidates) > max_files:
+        for source_file in candidates[max_files:]:
+            _set_coverage_status(
+                coverage_index,
+                source_file.relative_to(root).as_posix(),
+                "skipped",
+                "file-count limit",
+            )
         candidates = candidates[:max_files]
     started = time.monotonic()
     for index, source_file in enumerate(candidates):
+        relative_file = source_file.relative_to(root).as_posix()
         if timeout_seconds is not None and time.monotonic() - started >= timeout_seconds:
             result.complete = False
             message = f"Taint scan exceeded {timeout_seconds} seconds"
@@ -1478,10 +1646,17 @@ def scan_plugin_with_taint(
             result.findings.append(
                 _incomplete_finding("<scan>", 1, message, "timeout")
             )
+            for remaining in candidates[index:]:
+                remaining_relative = remaining.relative_to(root).as_posix()
+                _set_coverage_status(
+                    coverage_index, remaining_relative, "skipped", message
+                )
             break
-        relative_file = source_file.relative_to(root).as_posix()
         file_started = time.perf_counter()
-        _analyze_taint_file(source_file, relative_file, result)
+        status, reason = _analyze_taint_file(
+            source_file, relative_file, result
+        )
+        _set_coverage_status(coverage_index, relative_file, status, reason or "")
         file_elapsed = time.perf_counter() - file_started
         if file_elapsed >= MAX_FILE_ANALYSIS_SECONDS:
             result.complete = False
@@ -1504,6 +1679,12 @@ def scan_plugin_with_taint(
                     "per_file_timeout",
                 )
             )
+            _set_coverage_status(
+                coverage_index,
+                relative_file,
+                "skipped",
+                f"Per-file taint analysis exceeded {MAX_FILE_ANALYSIS_SECONDS:g} seconds",
+            )
         if (
             timeout_seconds is not None
             and time.monotonic() - started >= timeout_seconds
@@ -1525,10 +1706,23 @@ def scan_plugin_with_taint(
             result.findings.append(
                 _incomplete_finding("<scan>", 1, message, "timeout")
             )
+            for remaining in candidates[index + 1 :]:
+                remaining_relative = remaining.relative_to(root).as_posix()
+                _set_coverage_status(
+                    coverage_index, remaining_relative, "skipped", message
+                )
             break
-    if over_file_limit:
+    skipped_for_limit = [
+        entry for entry in coverage_entries
+        if entry.get("status") == "skipped"
+        and entry.get("reason") == "file-count limit"
+    ]
+    if skipped_for_limit:
         result.complete = False
-        message = f"Taint scan exceeded the {max_files}-file analysis limit"
+        message = (
+            f"Taint scan exceeded the {max_files}-file analysis limit; "
+            f"{len(skipped_for_limit)} PHP file(s) were not analyzed"
+        )
         result.diagnostics.append(
             {
                 "file": "<scan>",
@@ -1541,6 +1735,18 @@ def scan_plugin_with_taint(
             _incomplete_finding("<scan>", 1, message, "file_count_limit")
         )
 
+    for entry in coverage_entries:
+        if entry.get("status") == "pending":
+            _set_coverage_status(
+                coverage_index,
+                entry["path"],
+                "skipped",
+                "file was not reached by the analysis loop",
+            )
+    result.coverage = _coverage_report(coverage_entries)
+    if not result.coverage["complete"]:
+        result.complete = False
+
     _finalize_taint_summary(result)
     if result.query_build_available:
         result.audit.extend(result.recognized_audits)
@@ -1549,9 +1755,25 @@ def scan_plugin_with_taint(
 
 def _analyze_taint_file(
     source_file: Path, relative_file: str, result: TaintScanSummary
-) -> None:
+) -> tuple[str, str | None]:
     try:
-        if source_file.stat().st_size == 0:
+        file_size = source_file.stat().st_size
+        if file_size > MAX_SOURCE_BYTES:
+            message = f"PHP source exceeds {MAX_SOURCE_BYTES} byte source limit"
+            result.complete = False
+            result.diagnostics.append(
+                {
+                    "file": relative_file,
+                    "line": 1,
+                    "code": "source_limit",
+                    "message": message,
+                }
+            )
+            result.findings.append(
+                _incomplete_finding(relative_file, 1, message, "source_limit")
+            )
+            return "oversized", message
+        if file_size == 0:
             message = "Empty PHP file skipped; no source was analyzed."
             result.complete = False
             result.diagnostics.append(
@@ -1565,7 +1787,7 @@ def _analyze_taint_file(
             result.findings.append(
                 _incomplete_finding(relative_file, 1, message, "empty_file")
             )
-            return
+            return "unsupported", message
     except OSError as error:
         message = f"Could not inspect PHP file: {error}"
         result.complete = False
@@ -1580,9 +1802,11 @@ def _analyze_taint_file(
         result.findings.append(
             _incomplete_finding(relative_file, 1, message, "read_error")
         )
-        return
+        return "unreadable", message
 
     program = parse_php_file(source_file)
+    file_status = "scanned"
+    file_reason: str | None = None
     if not program.complete:
         result.complete = False
         result.diagnostics.extend(
@@ -1605,6 +1829,15 @@ def _analyze_taint_file(
                 "incomplete_parse",
             )
         )
+        if any(item.code == "read_error" for item in program.diagnostics):
+            file_status = "unreadable"
+            file_reason = note or "Could not read PHP source"
+        elif any(item.code == "source_limit" for item in program.diagnostics):
+            file_status = "oversized"
+            file_reason = note or "PHP source exceeded parser limit"
+        else:
+            file_status = "unsupported"
+            file_reason = note or "PHP parser did not complete"
     else:
         if any(
             class_def.name.casefold() == "query"
@@ -1657,6 +1890,8 @@ def _analyze_taint_file(
                     "incomplete_taint",
                 )
             )
+            file_status = "unsupported"
+            file_reason = note or "analysis limit reached"
         flow_findings = [
             _finding_from_flow(
                 flow,
@@ -1711,6 +1946,8 @@ def _analyze_taint_file(
         result.findings.append(
             _incomplete_finding(relative_file, 1, message, "secret_read_error")
         )
+        return "unreadable", message
+    return file_status, file_reason
 
 
 def scan_php_file_with_summary(path: str | Path) -> ScanSummary:
@@ -1729,9 +1966,32 @@ def scan_php_file_with_summary(path: str | Path) -> ScanSummary:
     if skip_reason is None:
         regex_summary.scanned_files = 1
         regex_summary.findings.extend(findings)
+        regex_summary.coverage = _coverage_report(
+            [
+                {
+                    "kind": "php_file",
+                    "path": source_file.name,
+                    "status": "scanned",
+                    "classification": "first_party",
+                    "reason": "",
+                }
+            ]
+        )
     else:
         regex_summary.skipped.append(
             {"path": source_file.name, "reason": skip_reason}
+        )
+        status = "oversized" if skip_reason == "oversized" else "unreadable"
+        regex_summary.coverage = _coverage_report(
+            [
+                {
+                    "kind": "php_file",
+                    "path": source_file.name,
+                    "status": status,
+                    "classification": "first_party",
+                    "reason": skip_reason,
+                }
+            ]
         )
     return regex_summary
 
@@ -1743,7 +2003,22 @@ def scan_php_file_with_taint(
     source_file = Path(path).expanduser().resolve()
     regex_summary = scan_php_file_with_summary(path)
     taint_summary = TaintScanSummary()
-    _analyze_taint_file(source_file, source_file.name, taint_summary)
+    status, reason = _analyze_taint_file(
+        source_file, source_file.name, taint_summary
+    )
+    taint_summary.coverage = _coverage_report(
+        [
+            {
+                "kind": "php_file",
+                "path": source_file.name,
+                "status": status,
+                "classification": "first_party",
+                "reason": reason or "",
+            }
+        ]
+    )
+    if not taint_summary.coverage["complete"]:
+        taint_summary.complete = False
     _finalize_taint_summary(taint_summary)
     return regex_summary, taint_summary
 
@@ -1759,7 +2034,9 @@ def list_scan_files(
         return [
             source_file
             for source_file in sorted(root.rglob("*"))
-            if source_file.is_file() and _is_in_scan_scope(source_file, root)
+            if source_file.is_file()
+            and not source_file.is_symlink()
+            and _is_in_scan_scope(source_file, root)
         ]
     if max_files < 1:
         raise ValueError("File limit must be positive")
@@ -1772,21 +2049,12 @@ def list_scan_files(
             for directory in directories
             if not (current_path / directory).is_symlink()
             and directory.lower() not in IGNORE_DIRS
-            and (
-                current_path != root
-                or directory.lower() in PRIMARY_DIRECTORIES
-            )
         )
         for filename in sorted(filenames):
             source_file = current_path / filename
             if (
-                source_file.suffix.lower() == ".php"
-                and not source_file.is_symlink()
-                and (
-                    current_path == root
-                    or current_path.relative_to(root).parts[0].lower()
-                    in PRIMARY_DIRECTORIES
-                )
+                not source_file.is_symlink()
+                and _is_in_scan_scope(source_file, root)
             ):
                 candidates.append(source_file)
                 if len(candidates) >= max_files:

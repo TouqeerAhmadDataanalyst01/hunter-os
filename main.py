@@ -46,6 +46,69 @@ class ScanResult:
     exit_code: int
 
 
+def _coverage_after_timeout(
+    coverage: dict[str, object], reason: str
+) -> dict[str, object]:
+    files = [
+        dict(entry)
+        for entry in coverage.get("files", [])
+        if isinstance(entry, dict)
+    ]
+    for entry in files:
+        if entry.get("status") in {"pending", "scanned"}:
+            entry["status"] = "skipped"
+            entry["reason"] = reason
+
+    status_totals: dict[str, int] = {}
+    for entry in files:
+        status = str(entry.get("status", "skipped"))
+        status_totals[status] = status_totals.get(status, 0) + 1
+    non_file_issues = [
+        dict(entry)
+        for entry in coverage.get("non_file_issues", [])
+        if isinstance(entry, dict)
+    ]
+    non_file_issues.append(
+        {
+            "kind": "scan",
+            "path": "<scan>",
+            "status": "skipped",
+            "classification": "unknown",
+            "reason": reason,
+        }
+    )
+    incomplete_reasons = [
+        {
+            "path": entry.get("path", "<unknown>"),
+            "status": entry.get("status", "skipped"),
+            "reason": entry.get("reason", reason),
+        }
+        for entry in files
+        if entry.get("status")
+        in {"unsupported", "oversized", "unreadable", "skipped"}
+    ]
+    incomplete_reasons.extend(
+        {
+            "path": entry.get("path", "<unknown>"),
+            "status": entry.get("status", "skipped"),
+            "reason": entry.get("reason", reason),
+        }
+        for entry in non_file_issues
+        if entry.get("status") in {"unsupported", "oversized", "unreadable", "skipped"}
+    )
+    incomplete_reasons.append(
+        {"path": "<scan>", "status": "skipped", "reason": reason}
+    )
+    return {
+        **coverage,
+        "complete": False,
+        "php_files_by_status": status_totals,
+        "incomplete_reasons": incomplete_reasons,
+        "non_file_issues": non_file_issues,
+        "files": files,
+    }
+
+
 def _legacy_json_records(
     findings: list[dict[str, object]], platform: str = "wordpress"
 ) -> list[dict[str, object]]:
@@ -155,22 +218,26 @@ def scan_target(
             taint_summary = taint_future.result(timeout=remaining)
         except FutureTimeoutError:
             taint_future.cancel()
+            timeout_message = f"taint scan exceeded {timeout_seconds} seconds"
             taint_summary = TaintScanSummary(
                 findings=[
                     _incomplete_finding(
                         "<scan>",
                         1,
-                        f"taint scan exceeded {timeout_seconds} seconds",
+                        timeout_message,
                         "timeout",
                     )
                 ],
                 complete=False,
+                coverage=_coverage_after_timeout(
+                    summary.coverage, timeout_message
+                ),
                 diagnostics=[
                     {
                         "file": "<scan>",
                         "line": 1,
                         "code": "timeout",
-                        "message": f"Taint scan exceeded {timeout_seconds} seconds",
+                        "message": timeout_message,
                     }
                 ],
             )
@@ -196,6 +263,13 @@ def scan_target(
         f"[scan] Potential findings: {len(findings)}; "
         f"nearby auth signals to review: {auth_count}."
     )
+    if taint_summary is not None:
+        coverage = taint_summary.coverage
+        print(
+            f"[coverage] PHP files: {coverage.get('discovered_php_files', 0)}; "
+            f"complete: {coverage.get('complete', False)}; "
+            f"statuses: {coverage.get('php_files_by_status', {})}."
+        )
     if taint_summary is None:
         json_path = write_json_report(slug, platform, findings, report_root)
     else:
@@ -216,6 +290,7 @@ def scan_target(
             report_root,
             v5_taint_findings=active_taint_findings,
             v5_audit=taint_summary.audit,
+            v5_coverage=taint_summary.coverage,
         )
     print(f"[report] Saved current-run JSON to {json_path}")
 
@@ -242,6 +317,7 @@ def scan_target(
             ],
             taint_summary.audit,
             report_root,
+            coverage=taint_summary.coverage,
         )
         if v5_report_path is not None:
             print(f"[report] Saved V5 taint evidence to {v5_report_path}")
@@ -257,6 +333,7 @@ def scan_target(
                 for finding in taint_summary.findings
             )
         )
+        or (taint_summary and not taint_summary.coverage.get("complete", True))
         else 0,
     )
 
@@ -330,22 +407,26 @@ def scan_source_path(
                 taint_summary = taint_future.result(timeout=remaining)
             except FutureTimeoutError:
                 taint_future.cancel()
+                timeout_message = f"taint scan exceeded {timeout_seconds} seconds"
                 taint_summary = TaintScanSummary(
                     findings=[
                         _incomplete_finding(
                             "<scan>",
                             1,
-                            f"taint scan exceeded {timeout_seconds} seconds",
+                            timeout_message,
                             "timeout",
                         )
                     ],
                     complete=False,
+                    coverage=_coverage_after_timeout(
+                        summary.coverage, timeout_message
+                    ),
                     diagnostics=[
                         {
                             "file": "<scan>",
                             "line": 1,
                             "code": "timeout",
-                            "message": f"Taint scan exceeded {timeout_seconds} seconds",
+                            "message": timeout_message,
                         }
                     ],
                 )
@@ -374,6 +455,7 @@ def scan_source_path(
                 report_root,
                 v5_taint_findings=active_taint,
                 v5_audit=taint_summary.audit,
+                v5_coverage=taint_summary.coverage,
             )
 
         for finding in findings:
@@ -395,6 +477,7 @@ def scan_source_path(
                 ],
                 taint_summary.audit,
                 report_root,
+                coverage=taint_summary.coverage,
             )
             if v5_report_path is not None:
                 print(f"[report] Saved V5 taint evidence to {v5_report_path}")
@@ -409,6 +492,10 @@ def scan_source_path(
                     finding.get("status") != "DOWNGRADED"
                     for finding in taint_summary.findings
                 )
+            )
+            or (
+                taint_summary
+                and not taint_summary.coverage.get("complete", True)
             )
             else 0,
         )
@@ -488,11 +575,18 @@ def main(argv: list[str] | None = None) -> int:
                     "findings": records,
                     "v5_taint_findings": active_taint_findings,
                     "v5_audit": taint_summary.audit,
+                    "v5_coverage": taint_summary.coverage,
                 },
                 indent=2,
             )
         )
-        return 1 if records or active_taint_findings else 0
+        return (
+            1
+            if records
+            or active_taint_findings
+            or not taint_summary.coverage.get("complete", True)
+            else 0
+        )
 
     print("Hunter OS v4: offline project identification and WordPress source review")
     print("No remote downloads, vulnerability-site requests, or exploit requests are made.")

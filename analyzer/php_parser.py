@@ -1206,7 +1206,7 @@ class _Parser:
                 tokens[-1],
                 "parser_error",
             )
-        for token in tokens:
+        for index, token in enumerate(tokens):
             if token.kind == "unsupported":
                 self._diagnose("Unsupported expression token", token)
             if (
@@ -1216,6 +1216,26 @@ class _Parser:
                 self._diagnose(
                     f"{token.value} expression syntax is outside the parsed subset",
                     token,
+                )
+            if token.kind != "identifier":
+                continue
+            keyword = token.value.casefold()
+            next_index = index + 1
+            if next_index < len(tokens) and tokens[next_index].value == "&":
+                next_index += 1
+            if keyword == "function" and (
+                next_index < len(tokens) and tokens[next_index].value == "("
+            ):
+                self._diagnose(
+                    "Anonymous closure body is not analyzed",
+                    token,
+                    "unsupported_closure",
+                )
+            elif keyword == "fn":
+                self._diagnose(
+                    "Arrow function body is not analyzed",
+                    token,
+                    "unsupported_closure",
                 )
         return Expression(
             self._text(tokens),

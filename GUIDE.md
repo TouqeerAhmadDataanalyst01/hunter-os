@@ -112,6 +112,7 @@ In taint mode, the JSON report preserves the separate result categories:
 - **V4 findings (`findings`):** results from the earlier regex checks. Their shape and meaning are separate from the V5 taint results.
 - **V5 active (`v5_taint_findings`):** taint results not downgraded by the judge. They need review; “active” does not mean confirmed exploitable.
 - **V5 audit (`v5_audit`):** downgraded findings and incomplete-analysis records retained for inspection. Check the reason, trace, sanitizer evidence, authorization evidence, and notes.
+- **V5 coverage (`v5_coverage`):** a status for each discovered PHP file. Unsupported, oversized, unreadable, or skipped in-scope files mean the scan is incomplete, not clean. Explicit exclusions show their paths and classifications.
 
 ### What “DOWNGRADED” means
 

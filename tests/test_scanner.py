@@ -79,7 +79,7 @@ class ScannerTests(unittest.TestCase):
             self.assertTrue(findings[0]["auth_present"])
             self.assertEqual(findings[0]["auth_check"], "check_admin_referer")
 
-    def test_scans_only_root_and_primary_directories_outside_vendor(self) -> None:
+    def test_scans_nested_product_code_and_tracks_excluded_directories(self) -> None:
         with tempfile.TemporaryDirectory() as temporary_directory:
             root = Path(temporary_directory)
             source_files = {
@@ -93,6 +93,9 @@ class ScannerTests(unittest.TestCase):
                 "test/helper.php": "<?php $file = $_FILES['test'];",
                 "my-vendor-helper.php": "<?php $file = $_FILES['vendor_name'];",
                 "assets/handler.php": "<?php $file = $_FILES['assets'];",
+                "build/generated.php": "<?php $file = $_FILES['generated'];",
+                "plugin.min.php": "<?php $file = $_FILES['minified'];",
+                "dist/bundle.php": "<?php $file = $_FILES['dist'];",
             }
             for relative_name, content in source_files.items():
                 source_path = root / relative_name
@@ -109,8 +112,50 @@ class ScannerTests(unittest.TestCase):
                     "admin/handler.php",
                     "public/handler.php",
                     "my-vendor-helper.php",
+                    "assets/handler.php",
+                    "build/generated.php",
+                    "plugin.min.php",
                 },
             )
+            summary = scan_plugin_with_summary(root)
+            coverage = summary.coverage
+            self.assertTrue(coverage["complete"])
+            self.assertEqual(coverage["php_files_by_status"]["scanned"], 8)
+            self.assertEqual(
+                coverage["php_files_by_status"]["intentionally_excluded"], 5
+            )
+            self.assertEqual(
+                coverage["php_files_by_classification"]["generated"], 2
+            )
+            self.assertEqual(
+                {item["path"] for item in coverage["intentional_exclusions"]},
+                {
+                    "vendor/package/handler.php",
+                    "node_modules/package/handler.php",
+                    "tests/helper.php",
+                    "test/helper.php",
+                    "dist/bundle.php",
+                },
+            )
+
+    def test_nested_backend_directory_covers_all_64_first_party_php_files(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            backend = root / "backend"
+            backend.mkdir()
+            for index in range(64):
+                (backend / f"module-{index:02}.php").write_text(
+                    "<?php $value = 1;",
+                    encoding="utf-8",
+                )
+
+            summary = scan_plugin_with_taint(root)
+
+        self.assertTrue(summary.coverage["complete"])
+        self.assertEqual(summary.coverage["discovered_php_files"], 64)
+        self.assertEqual(summary.coverage["php_files_by_status"], {"scanned": 64})
+        self.assertEqual(summary.coverage["php_files_by_classification"], {"first_party": 64})
+        self.assertEqual(summary.findings, [])
 
     def test_auth_check_beyond_50_lines_does_not_mark_finding_safe(self) -> None:
         with tempfile.TemporaryDirectory() as temporary_directory:
@@ -405,7 +450,7 @@ class ScannerTests(unittest.TestCase):
             self.assertFalse((first / "second.php").exists())
             self.assertTrue((second / "second.php").is_file())
 
-    def test_scan_summary_reports_oversized_unreadable_and_out_of_scope_paths(self) -> None:
+    def test_scan_summary_reports_oversized_unreadable_and_scans_nested_paths(self) -> None:
         with tempfile.TemporaryDirectory() as temporary_directory:
             root = Path(temporary_directory)
             (root / "plugin.php").write_text("<?php", encoding="utf-8")
@@ -426,11 +471,14 @@ class ScannerTests(unittest.TestCase):
             with patch.object(Path, "read_text", failing_read):
                 summary = scan_plugin_with_summary(root)
 
-            self.assertEqual(summary.scanned_files, 1)
+            self.assertEqual(summary.scanned_files, 2)
             dispositions = {(entry["path"], entry["reason"]) for entry in summary.skipped}
             self.assertIn(("large.php", "oversized"), dispositions)
             self.assertIn(("includes/unreadable.php", "unreadable"), dispositions)
-            self.assertIn(("assets/**", "out of scan scope"), dispositions)
+            self.assertEqual(summary.coverage["php_files_by_status"]["scanned"], 2)
+            self.assertEqual(summary.coverage["php_files_by_status"]["oversized"], 1)
+            self.assertEqual(summary.coverage["php_files_by_status"]["unreadable"], 1)
+            self.assertFalse(summary.coverage["complete"])
 
     def test_missing_source_prints_manual_download_instruction(self) -> None:
         with tempfile.TemporaryDirectory() as temporary_directory:
@@ -636,7 +684,10 @@ class PhpParserTests(unittest.TestCase):
             "{ return wrap($x, $values); }; "
             "return array_map(fn($x) => convert($x), $values); }"
         )
-        self.assertTrue(program.complete, program.diagnostics)
+        self.assertFalse(program.complete)
+        self.assertTrue(any(
+            item.code == "unsupported_closure" for item in program.diagnostics
+        ))
         calls = program.functions[0].body[-1].value.calls
         self.assertEqual(calls[0].name, "array_map")
         self.assertEqual(calls[0].argument_calls[0][0].name, "convert")
